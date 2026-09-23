@@ -87,6 +87,7 @@
         spaceName: '',
         searchValue: '',
         isVisible: false,
+        isInitialLoad: true, // 标记是否是首次加载
       };
     },
     computed: {
@@ -143,6 +144,10 @@
         'getSpaceDetail',
         'getCurrentSpacePermission',
       ]),
+      ...mapActions('user', [
+        'getUserPreference',
+        'saveUserPreference',
+      ]),
       ...mapMutations([
         'setSpaceId',
         'setSpaceList',
@@ -175,7 +180,14 @@
           } else {
             this.spaceList.push(...resp.data.results);
           }
-          // 默认获取第一个
+
+          // 首次加载时，尝试恢复用户上次选择的空间
+          if (this.isInitialLoad && !this.searchValue) {
+            this.isInitialLoad = false;
+            await this.restoreLastSelectedSpace();
+          }
+
+          // 默认获取第一个（如果没有设置 spaceId）
           if (!this.spaceId) {
             this.setSpaceId(this.spaceList[0]?.id);
           }
@@ -210,6 +222,8 @@
       },
       handleSpaceSelected(val) {
         this.setSpaceId(val);
+        // 保存用户选择的空间到后台
+        this.saveUserSpacePreference(val);
         const redirectMap = {
           '/template': {
             name: 'spaceAdmin',
@@ -276,6 +290,37 @@
         // 转成RGB 16进制字符串
         ret = ret.toString(16).padEnd(6, 'f');
         return `#${ret}`;
+      },
+      /**
+       * 恢复用户上次选择的空间
+       */
+      async restoreLastSelectedSpace() {
+        try {
+          const resp = await this.getUserPreference();
+          if (resp.result && resp.data && resp.data.last_selected_space_id) {
+            const lastSpaceId = resp.data.last_selected_space_id;
+            // 检查该空间是否在当前列表中
+            const spaceExists = this.spaceList.some(space => space.id === lastSpaceId);
+            if (spaceExists) {
+              // 如果空间存在，则切换到该空间
+              this.setSpaceId(lastSpaceId);
+              console.log(`[MenuSelect] 恢复上次选择的空间: ${lastSpaceId}`);
+            }
+          }
+        } catch (error) {
+          console.warn('[MenuSelect] 获取用户偏好设置失败:', error);
+        }
+      },
+      /**
+       * 保存用户选择的空间到后台
+       */
+      async saveUserSpacePreference(spaceId) {
+        try {
+          await this.saveUserPreference({ space_id: spaceId });
+          console.log(`[MenuSelect] 保存用户选择的空间: ${spaceId}`);
+        } catch (error) {
+          console.warn('[MenuSelect] 保存用户偏好设置失败:', error);
+        }
       },
     },
   };

@@ -34,6 +34,7 @@ from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
 from bkflow.contrib.api.collections.task import TaskComponentClient
+from bkflow.interface.models import UserPreference
 from bkflow.space.configs import SuperusersConfig
 from bkflow.space.models import Space, SpaceConfig
 from bkflow.space.tenant import ensure_space_tenant, tenant_space_ids
@@ -164,3 +165,76 @@ def callback(request, token):
     )
     status = 400 if is_open_plugin_callback and not resp.get("result") else 200
     return JsonResponse(resp, status=status)
+
+
+@ensure_csrf_cookie
+@require_GET
+def get_user_preference(request):
+    """
+    获取用户偏好设置
+    """
+    username = request.user.username
+    try:
+        preference = UserPreference.objects.get(username=username)
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "last_selected_space_id": preference.last_selected_space_id,
+                    "preferences": preference.preferences,
+                },
+                "message": "",
+            }
+        )
+    except UserPreference.DoesNotExist:
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "last_selected_space_id": None,
+                    "preferences": {},
+                },
+                "message": "",
+            }
+        )
+    except Exception as e:
+        logger.error(f"[get_user_preference] Error: {str(e)}")
+        return JsonResponse({"result": False, "data": None, "message": str(e)}, status=500)
+
+
+@ensure_csrf_cookie
+@require_POST
+def save_user_preference(request):
+    """
+    保存用户偏好设置
+    """
+    username = request.user.username
+    try:
+        data = json.loads(request.body)
+        space_id = data.get("space_id")
+
+        if space_id is None:
+            return JsonResponse({"result": False, "data": None, "message": "space_id is required"})
+
+        # 更新或创建用户偏好
+        preference, created = UserPreference.objects.update_or_create(
+            username=username,
+            defaults={"last_selected_space_id": space_id}
+        )
+
+        logger.info(f"[save_user_preference] User: {username}, Space ID: {space_id}, Created: {created}")
+
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "last_selected_space_id": preference.last_selected_space_id,
+                },
+                "message": "保存成功" if created else "更新成功",
+            }
+        )
+    except json.JSONDecodeError:
+        return JsonResponse({"result": False, "data": None, "message": "Invalid JSON"}, status=400)
+    except Exception as e:
+        logger.error(f"[save_user_preference] Error: {str(e)}")
+        return JsonResponse({"result": False, "data": None, "message": str(e)}, status=500)

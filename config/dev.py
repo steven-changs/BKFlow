@@ -91,3 +91,39 @@ try:
     from local_settings import *  # noqa
 except ImportError:
     pass
+
+# 本地开发：无条件移除 CSRF 中间件并添加调试中间件
+middleware_list = list(MIDDLEWARE)
+middleware_list = [m for m in middleware_list if 'CsrfViewMiddleware' not in m]
+# 添加 CSRF 调试中间件到最前面
+middleware_list.insert(0, 'bkflow.csrf_debug_middleware.CSRFDebugMiddleware')
+MIDDLEWARE = tuple(middleware_list)
+import sys
+sys.stderr.write(f"[OK] CSRF middleware removed - total middleware: {len(MIDDLEWARE)}\n")
+sys.stderr.write(f"[DEBUG] Has CSRF: {any('Csrf' in m for m in MIDDLEWARE)}\n")
+sys.stderr.flush()
+
+# 本地开发完全禁用登录验证
+if 'DisableLoginMiddleware' in dir():
+    middleware_list = list(MIDDLEWARE)
+    # 移除 BlueKing 的登录中间件
+    middleware_list = [m for m in middleware_list if 'LoginRequiredMiddleware' not in m]
+    # 在最前面添加禁用登录的中间件
+    if 'local_settings.DisableLoginMiddleware' not in middleware_list:
+        middleware_list.insert(0, 'local_settings.DisableLoginMiddleware')
+        MIDDLEWARE = tuple(middleware_list)
+        print(f"[OK] Login verification DISABLED - total middleware: {len(MIDDLEWARE)}")
+
+# 完全禁用登录检查的配置
+IS_AJAX_PLAIN_MODE = True
+LOGIN_EXEMPT_WHITE_LIST = ['*']
+
+# 本地开发禁用 CSRF 保护
+CSRF_COOKIE_SECURE = False
+CSRF_TRUSTED_ORIGINS = ['https://localhost:9007', 'http://localhost:8000']
+
+# 添加自定义异常处理器以追踪 CSRF 错误
+REST_FRAMEWORK = {
+    'EXCEPTION_HANDLER': 'bkflow.custom_exception_handler.custom_exception_handler',
+}
+

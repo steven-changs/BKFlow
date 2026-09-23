@@ -27,6 +27,7 @@ from django.db import transaction
 from django.db.models import Subquery
 from django.utils.decorators import method_decorator
 from django.utils.translation import ugettext_lazy as _
+from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import CharFilter, DjangoFilterBackend, FilterSet
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework import mixins
@@ -465,6 +466,12 @@ class TemplateViewSet(TenantScopeMixin, UserModelViewSet):
         AdminPermission | SpaceSuperuserPermission | TemplatePermission | TemplateMockPermission | ScopePermission
     ]
 
+    def dispatch(self, request, *args, **kwargs):
+        # 本地开发环境：对 create_mock_task 跳过 CSRF 验证
+        if settings.DEBUG and request.path.endswith('create_mock_task/'):
+            setattr(request, '_dont_enforce_csrf_checks', True)
+        return super().dispatch(request, *args, **kwargs)
+
     @action(methods=["GET"], detail=False, url_path="list_template")
     def list_template(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
@@ -646,6 +653,13 @@ class TemplateViewSet(TenantScopeMixin, UserModelViewSet):
     )
     @action(methods=["POST"], detail=True, url_path="create_mock_task")
     def create_mock_task(self, request, *args, **kwargs):
+        # 调试：打印接收到的 CSRF 相关信息
+        import logging
+        logger = logging.getLogger("root")
+        logger.error(f"[CSRF DEBUG] COOKIES: {request.COOKIES}")
+        logger.error(f"[CSRF DEBUG] META CSRF: {request.META.get('HTTP_X_CSRFTOKEN', 'NOT SET')}")
+        logger.error(f"[CSRF DEBUG] _dont_enforce_csrf_checks: {getattr(request, '_dont_enforce_csrf_checks', False)}")
+
         template = self.get_object()
         ser = CreateMockTaskWithPipelineTreeSerializer(data=request.data)
         ser.is_valid(raise_exception=True)

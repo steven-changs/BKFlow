@@ -37,7 +37,8 @@ const proxyPath = [
   'is_admin_user',
   'task_system_superuser',
   'notice',
-  'is_current_space_admin'
+  'is_current_space_admin',
+  'static'  // 添加 static 路径，用于加载插件的静态文件
 ];
 const context = proxyPath.map(item => SITE_URL + item);
 
@@ -109,6 +110,20 @@ module.exports = merge(webpackBase, {
         target: env.API_URL,
         secure: false,
         changeOrigin: true,
+        cookieDomainRewrite: 'localhost',  // 重写 cookie 域名以便浏览器接受
+        cookiePathRewrite: '/',
+        onProxyReq: (proxyReq, req, res) => {
+          // 确保转发所有 cookie 和 CSRF token
+          if (req.headers.cookie) {
+            proxyReq.setHeader('cookie', req.headers.cookie);
+          }
+          if (req.headers['x-csrftoken']) {
+            proxyReq.setHeader('X-CSRFToken', req.headers['x-csrftoken']);
+          }
+          // 调试日志
+          console.log('[Proxy] Cookie:', req.headers.cookie);
+          console.log('[Proxy] X-CSRFToken:', req.headers['x-csrftoken']);
+        },
         headers: {
           referer: env.API_URL,
         },

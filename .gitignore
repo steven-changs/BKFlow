@@ -167,5 +167,12 @@ pre-*-bkcodeai
 
 # Local files
 backup/
+owner/
 cov.xml
 .DS_Store
+
+# BKFlow 本地部署相关文件
+requirements_local.txt
+logs/
+media/
+celerybeat-schedule.db

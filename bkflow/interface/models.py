@@ -18,6 +18,7 @@ We undertake not to change the open source license (MIT license) applicable
 to the current version of the project delivered to anyone in the future.
 """
 from django.db import models
+from django.utils.translation import ugettext_lazy as _
 
 
 class EnvVarManager(models.Manager):
@@ -39,3 +40,20 @@ class EnvironmentVariables(models.Model):
     class Meta:
         verbose_name = "环境变量 EnvironmentVariables"
         verbose_name_plural = "环境变量 EnvironmentVariables"
+
+
+class UserPreference(models.Model):
+    """用户偏好设置"""
+    username = models.CharField(_("用户名"), max_length=128, unique=True, db_index=True)
+    last_selected_space_id = models.IntegerField(_("上次选择的空间ID"), null=True, blank=True)
+    preferences = models.JSONField(_("其他偏好设置"), default=dict, blank=True)
+    create_at = models.DateTimeField(_("创建时间"), auto_now_add=True)
+    update_at = models.DateTimeField(_("更新时间"), auto_now=True)
+
+    class Meta:
+        verbose_name = "用户偏好设置 UserPreference"
+        verbose_name_plural = "用户偏好设置 UserPreference"
+        db_table = "user_preference"
+
+    def __str__(self):
+        return f"{self.username} - Space: {self.last_selected_space_id}"
