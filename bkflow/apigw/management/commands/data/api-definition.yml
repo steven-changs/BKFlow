@@ -1,0 +1,48 @@
+spec_version: 2
+
+apigateway:
+  description: {{ settings.BK_APP_CODE }} apigw
+  is_public: true
+  maintainers:
+    {% for member in settings.BK_APIGW_MANAGER_MAINTAINERS %}
+    - "{{ member }}"
+    {% endfor %}
+
+stages:
+  - name: {{ settings.BK_APIGW_STAGE_NAME }}
+    vars:
+      api_sub_path: "{{ settings.BK_APIGW_API_SERVER_SUB_PATH }}"
+    backends:
+      - name: default
+        config:
+          timeout: 120
+          loadbalance: roundrobin
+          hosts:
+            - host: http://{{ settings.BK_APIGW_API_SERVER_HOST }}
+      - name: sdk
+        config:
+          timeout: 120
+          loadbalance: roundrobin
+          hosts:
+            - host: http://{{ settings.BK_APIGW_API_SERVER_HOST }}
+    plugin_configs:
+      - type: bk-rate-limit
+        yaml: |-
+          rates:
+            __default:
+              - tokens: 5000
+                period: 60
+
+grant_permissions:
+  {% for app_code in settings.BK_APIGW_GRANT_APPS %}
+  - bk_app_code: "{{ app_code }}"
+    grant_dimension: "api"
+  {% endfor %}
+
+resource_docs:
+  archivefile: {{ settings.BK_APIGW_RESOURCE_DOCS_ARCHIVE_FILE }}
+
+release:
+  version: {{ settings.STATIC_VERSION }}+{{ settings.DEPLOY_DATETIME }}
+  title: "bkflow release"
+  comment: "auto release by bkflow"

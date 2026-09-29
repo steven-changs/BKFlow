@@ -1,0 +1,387 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+
+import logging
+
+from django.utils.translation import ugettext_lazy as _
+from drf_yasg.utils import swagger_auto_schema
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.viewsets import GenericViewSet
+
+from bkflow.contrib.api.collections.task import TaskComponentClient
+from bkflow.contrib.openapi.serializers import (
+    GetTasksStatesBodySerializer,
+    RenderConstantsBodySerializer,
+    TaskBatchDeleteSerializer,
+    TaskEngineAdminSerializer,
+)
+from bkflow.exceptions import APIRequestError
+from bkflow.interface.task.engine_compat import (
+    empty_wrapped_result,
+    enrich_task_list_result_labels,
+    fallback_if_engine_route_missing,
+    parse_task_ids,
+)
+from bkflow.interface.task.permissions import (
+    ScopePermission,
+    TaskMockTokenPermission,
+    TaskTokenPermission,
+)
+from bkflow.interface.task.utils import StageConstantHandler, StageJobStateHandler
+from bkflow.label.models import Label
+from bkflow.permission.models import (
+    TASK_AUTH_CODES,
+    TEMPLATE_PERMISSION_TO_TASK_AUTH,
+    ResourceType,
+)
+from bkflow.permission.services import get_valid_token, iter_user_grants
+from bkflow.space.configs import SuperusersConfig
+from bkflow.space.models import SpaceConfig
+from bkflow.space.permissions import SpaceSuperuserPermission
+from bkflow.space.tenant import TenantScopeMixin, ensure_space_tenant
+from bkflow.utils.permissions import AdminPermission
+from bkflow.utils.renderers import get_node_detail_renderer_classes
+from bkflow.utils.time_zone import get_user_timezone
+from bkflow.utils.trace import CallFrom, append_attributes, start_trace
+from bkflow.utils.webhook import get_webhook_delivery_history_by_delivery_id
+
+logger = logging.getLogger("root")
+
+
+class TaskInterfaceAdminViewSet(TenantScopeMixin, GenericViewSet):
+    permission_classes = [AdminPermission | SpaceSuperuserPermission]
+
+    @action(methods=["GET"], detail=False, url_path="get_task_list/(?P<space_id>\\d+)")
+    def get_task_list(self, request, space_id):
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, time_zone=time_zone)
+        # 把标签名称转换为id进行搜索
+        query_params = request.query_params.copy()
+        labels = request.query_params.get("label", "")
+        label_ids = Label.get_label_ids_by_names(labels, space_id)
+        if label_ids:
+            query_params["label"] = ",".join([str(label_id) for label_id in label_ids])
+        result = client.task_list(data={**query_params, "space_id": space_id})
+        return Response(enrich_task_list_result_labels(result))
+
+    @action(methods=["POST"], detail=False, url_path="update_labels/(?P<space_id>\\d+)/(?P<pk>\\d+)")
+    def update_labels(self, request, space_id, pk=None):
+        """
+        更新特定任务（pk指定）的标签列表。
+        请求体期望格式：{"label_ids": [1, 2, 5]}
+        """
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, time_zone=time_zone)
+        result = client.update_labels(pk, data={**request.data, "space_id": space_id})
+        labels_map = Label.objects.get_labels_map(set(result["data"]))
+        result["data"] = [labels_map.get(label_id) for label_id in result["data"]]
+        return Response(result)
+
+    @swagger_auto_schema(methods=["post"], operation_description="任务状态查询", request_body=GetTasksStatesBodySerializer)
+    @action(methods=["POST"], detail=False, url_path="get_tasks_states")
+    def get_tasks_states(self, request, *args, **kwargs):
+        time_zone = get_user_timezone(request)
+        ser = GetTasksStatesBodySerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        space_id, task_ids = ser.validated_data["space_id"], ser.validated_data["task_ids"]
+        client = TaskComponentClient(space_id=space_id, time_zone=time_zone)
+        result = client.get_tasks_states(data={"task_ids": task_ids, "space_id": space_id})
+        return Response(result)
+
+    @swagger_auto_schema(methods=["post"], operation_description="批量删除任务", request_body=TaskBatchDeleteSerializer)
+    @action(methods=["POST"], detail=False, url_path="batch_delete_tasks")
+    def batch_delete_tasks(self, request, *args, **kwargs):
+        time_zone = get_user_timezone(request)
+        ser = TaskBatchDeleteSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        space_id = ser.validated_data["space_id"]
+        client = TaskComponentClient(space_id=space_id, time_zone=time_zone)
+        data = {
+            "task_ids": ser.validated_data["task_ids"],
+            "is_full": ser.validated_data["is_full"],
+            "space_id": space_id,
+        }
+        if ser.validated_data["is_full"]:
+            data["is_mock"] = ser.validated_data["is_mock"]
+        result = client.batch_delete_tasks(data=data)
+        return Response(result)
+
+
+class TaskInterfaceSystemSuperuserViewSet(TenantScopeMixin, GenericViewSet):
+    permission_classes = [AdminPermission]
+
+    @swagger_auto_schema(methods=["post"], operation_description="触发引擎管理操作", request_body=TaskEngineAdminSerializer)
+    @action(methods=["POST"], detail=False, url_path="trigger_engine_admin_action")
+    def trigger_engine_admin_action(self, request, *args, **kwargs):
+        time_zone = get_user_timezone(request)
+        ser = TaskEngineAdminSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        space_id, instance_id, action, data = (
+            ser.validated_data["space_id"],
+            ser.validated_data["instance_id"],
+            ser.validated_data["action"],
+            ser.validated_data["data"],
+        )
+        client = TaskComponentClient(space_id=space_id, time_zone=time_zone)
+        result = client.trigger_engine_admin_action(instance_id, action, data=data)
+        return Response(result)
+
+
+class TaskInterfaceViewSet(TenantScopeMixin, GenericViewSet):
+    OPERATE_ABOVE_ACTIONS = ["operate_node", "operate_task"]
+    MOCK_ABOVE_ACTIONS = ["get_task_mock_data"]
+    permission_classes = [
+        AdminPermission | SpaceSuperuserPermission | TaskTokenPermission | TaskMockTokenPermission | ScopePermission
+    ]
+
+    @staticmethod
+    def _inject_user_task_auth(request, data):
+        if data.get("result", False):
+            task_detail = data["data"]
+            if request.user.is_superuser or getattr(request, "is_space_superuser", False):
+                task_detail["auth"] = TASK_AUTH_CODES
+                return
+
+            permissions = iter_user_grants(
+                task_detail["space_id"],
+                request.user.username,
+                [
+                    ("SCOPE", f"{task_detail['scope_type']}_{task_detail['scope_value']}"),
+                    ("TASK", task_detail["id"]),
+                    ("TEMPLATE", task_detail["template_id"]),
+                ],
+            )
+
+            # 模板权限增加 FLOW_ 前缀，便于前端区分模板权限与任务/作用域权限
+            auth_set = set()
+            for grant in permissions:
+                resource_type, permission_type = grant.resource_type, grant.permission_type
+                if resource_type == ResourceType.TEMPLATE.value:
+                    # 保留非标准组合的历史响应（如 TEMPLATE + OPERATE -> FLOW_OPERATE）。
+                    auth_set.add(TEMPLATE_PERMISSION_TO_TASK_AUTH.get(permission_type, f"FLOW_{permission_type}"))
+                else:
+                    auth_set.add(permission_type)
+
+            task_detail["auth"] = list(auth_set)
+
+    def get_space_id(self, request):
+        request_space_id = request.query_params.get("space_id", None) or request.data.get("space_id", None)
+        if request.user.is_superuser or request.user.username in SpaceConfig.get_config(
+            request_space_id, SuperusersConfig.name
+        ):
+            ensure_space_tenant(request, request_space_id)
+            return request_space_id
+
+        token = get_valid_token(request.token, request.user.username, request_space_id, request)
+        if token is not None:
+            ensure_space_tenant(request, token.space_id)
+            return token.space_id
+        logger.warning("find token is not exist")
+        raise APIRequestError(
+            _("当前token已过期或不存在，token={token}, user={username}").format(
+                token=request.token, username=request.user.username
+            )
+        )
+
+    @action(methods=["GET"], detail=False, url_path="get_task_detail/(?P<task_id>\\d+)")
+    def get_task_detail(self, request, task_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        result = client.get_task_detail(task_id)
+        self._inject_user_task_auth(request, result)
+        if result.get("result") and result.get("data"):
+            webhook_delivery_history = get_webhook_delivery_history_by_delivery_id(str(task_id))
+            result["data"]["webhook_delivery_history"] = webhook_delivery_history
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="get_task_states/(?P<task_id>\\d+)")
+    def get_task_states(self, request, task_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        data = {"space_id": space_id}
+        result = client.get_task_states(task_id, data=data)
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="get_task_mock_data/(?P<task_id>\\d+)")
+    def get_task_mock_data(self, request, task_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        result = client.get_task_mock_data(task_id)
+        return Response(result)
+
+    @action(methods=["POST"], detail=False, url_path="operate_task/(?P<task_id>\\d+)/(?P<operation>\\w+)")
+    def operate_task(self, request, task_id, operation, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        with start_trace(
+            "operate_task_interface", True, space_id=space_id, task_id=task_id, call_from=CallFrom.WEB.value
+        ):
+            append_attributes({"operation": operation})
+            client = TaskComponentClient(
+                space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone
+            )
+            request.data["operator"] = request.user.username
+            result = client.operate_task(task_id, operation, request.data)
+            return Response(result)
+
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="get_task_node_detail/(?P<task_id>\\w+)/node/(?P<node_id>\\w+)",
+        renderer_classes=get_node_detail_renderer_classes(),
+    )
+    def get_task_node_detail(self, request, task_id, node_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        result = client.get_task_node_detail(task_id, node_id, username=request.user.username, data=request.GET)
+        return Response(result)
+
+    @action(
+        methods=["POST"],
+        detail=False,
+        url_path="operate_node/(?P<task_id>\\d+)/node/(?P<node_id>\\w+)/(?P<operation>\\w+)",
+    )
+    def operate_node(self, request, task_id, node_id, operation, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        with start_trace(
+            "operate_task_node_interface",
+            True,
+            space_id=space_id,
+            task_id=task_id,
+            node_id=node_id,
+            call_from=CallFrom.WEB.value,
+        ):
+            append_attributes({"operation": operation})
+            client = TaskComponentClient(
+                space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone
+            )
+            request.data["operator"] = request.user.username
+            result = client.node_operate(task_id, node_id, operation, request.data)
+            return Response(result)
+
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="get_task_node_log/(?P<task_id>\\d+)/(?P<node_id>\\w+)/(?P<version>\\w+)",
+    )
+    def get_task_node_log(self, request, task_id, node_id, version, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        result = client.get_task_node_log(task_id, node_id, version, data=request.query_params)
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="render_current_constants/(?P<task_id>\\d+)")
+    def render_current_constants(self, request, task_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        result = client.render_current_constants(task_id)
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="get_task_operation_record/(?P<task_id>\\d+)")
+    def get_task_operation_record(self, request, task_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        result = client.get_task_operation_record(task_id, data=request.query_params)
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="get_node_snapshot_config/(?P<task_id>\\d+)/(?P<node_id>\\w+)")
+    def get_node_snapshot_config(self, request, task_id, node_id, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser, time_zone=time_zone)
+        data = {"node_id": node_id}
+        result = client.get_node_snapshot_config(task_id, data)
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="get_stage_job_states/(?P<task_id>\\d+)")
+    def get_stage_and_job_states(self, request, task_id, *args, **kwargs):
+        """获取stage和job状态的视图函数"""
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        handler = StageJobStateHandler(space_id, request.user.is_superuser, time_zone=time_zone)
+        result = handler.process(task_id)
+        return Response(result)
+
+    @action(methods=["POST"], detail=False, url_path="rendered_stage_constants/(?P<task_id>\\d+)")
+    @swagger_auto_schema(operation_description="渲染stage画布变量", request_body=RenderConstantsBodySerializer)
+    def render_stage_constants(self, request, task_id, *args, **kwargs):
+        """渲染stage画布变量"""
+        space_id = self.get_space_id(request)
+        time_zone = get_user_timezone(request)
+        serializer = RenderConstantsBodySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node_ids = serializer.validated_data.get("node_ids", [])
+        stage_constants = serializer.validated_data.get("to_render_constants", {})
+        handler = StageConstantHandler(space_id, request.user.is_superuser, time_zone=time_zone)
+        result = handler.process(task_id, node_ids, stage_constants)
+        return Response(result)
+
+    @action(methods=["GET"], detail=False, url_path="list_children_taskflow/(?P<task_id>\\d+)")
+    def list_children_taskflow(self, request, task_id, *args, **kwargs):
+        """获取根任务下的所有子任务列表"""
+        space_id = self.get_space_id(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser)
+        result = client.list_children_taskflow(data={"task_id": task_id, "space_id": space_id})
+        return Response(fallback_if_engine_route_missing(result, empty_wrapped_result({"tasks": [], "relations": {}})))
+
+    @action(methods=["GET"], detail=False, url_path="root_task_info")
+    def root_task_info(self, request, *args, **kwargs):
+        """批量查询任务是否包含子任务"""
+        space_id = self.get_space_id(request)
+        task_ids_param = request.query_params.get("task_ids")
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser)
+        result = client.root_task_info(data={"task_ids": task_ids_param, "space_id": space_id})
+        fallback = empty_wrapped_result(
+            {"has_children_taskflow": {task_id: False for task_id in parse_task_ids(task_ids_param)}}
+        )
+        return Response(fallback_if_engine_route_missing(result, fallback))
+
+    @action(methods=["POST"], detail=False, url_path="get_node_outputs")
+    def get_node_outputs(self, request, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser)
+        result = client.get_node_outputs(data={"space_id": space_id, **request.data})
+        return Response(fallback_if_engine_route_missing(result, empty_wrapped_result([])))
+
+    @action(methods=["GET"], detail=False, url_path="get_tasks_pipeline")
+    def get_tasks_pipeline(self, request, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser)
+        result = client.get_tasks_pipeline(
+            data={"space_id": space_id, "task_ids": request.query_params.get("task_ids")}
+        )
+        return Response(fallback_if_engine_route_missing(result, empty_wrapped_result({})))
+
+    @action(methods=["GET"], detail=False, url_path="batch_get_task_states")
+    def batch_get_task_states(self, request, *args, **kwargs):
+        space_id = self.get_space_id(request)
+        client = TaskComponentClient(space_id=space_id, from_superuser=request.user.is_superuser)
+        result = client.batch_get_task_states(
+            data={"space_id": space_id, "task_ids": request.query_params.get("task_ids")}
+        )
+        return Response(fallback_if_engine_route_missing(result, empty_wrapped_result({})))

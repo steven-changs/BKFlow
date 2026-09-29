@@ -1,0 +1,69 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+
+from django.conf import settings
+
+import env
+from bkflow.interface.models import EnvironmentVariables
+from bkflow.utils.time_zone import get_user_timezone
+
+
+def bkflow_settings(request):
+    frontend_entry_url = "{}bkflow".format(settings.STATIC_URL) if settings.RUN_VER == "open" else "/static/bkflow"
+    enable_notice_center = int(EnvironmentVariables.objects.get_var("ENABLE_NOTICE_CENTER", 0))
+    language = request.COOKIES.get("blueking_language", "zh-cn")
+    doc_lang_mappings = {"zh-cn": "ZH", "en": "EN"}
+    run_ver_key = "BKAPP_RUN_VER_NAME" if language == "zh-cn" else "BKAPP_RUN_VER_NAME_{}".format(language.upper())
+    time_zone = get_user_timezone(request)
+    if not time_zone:
+        time_zone = request.session.get("blueking_timezone", settings.TIME_ZONE)
+
+    ctx = {
+        "STATIC_URL": settings.STATIC_URL,
+        "BK_STATIC_URL": frontend_entry_url,
+        "MAX_NODE_EXECUTE_TIMEOUT": settings.MAX_NODE_EXECUTE_TIMEOUT,
+        "MEMBER_SELECTOR_DATA_HOST": settings.MEMBER_SELECTOR_DATA_HOST,
+        "APP_CODE": settings.APP_CODE,
+        "USERNAME": request.user.username,
+        "BK_DOC_URL": f"{env.BK_DOC_CENTER_HOST}/markdown/{doc_lang_mappings.get(language, 'ZH')}/BKFlow/1.8"
+        f"/UserGuide/Introduce/introduce.md",
+        # 是否开启通知中心
+        "ENABLE_NOTICE_CENTER": enable_notice_center,
+        "BK_PAAS_SHARED_RES_URL": env.BKPAAS_SHARED_RES_URL,
+        "APP_NAME": settings.APP_NAME,  # 应用名称
+        "RUN_VER_NAME": EnvironmentVariables.objects.get_var(run_ver_key, settings.RUN_VER_NAME),
+        "LOGIN_URL": env.BKFLOW_LOGIN_URL,
+        "MESSAGE_HELPER_URL": env.MESSAGE_HELPER_URL,
+        "BK_DOMAIN": env.BKPAAS_BK_DOMAIN,
+        "BK_PAAS_ESB_HOST": env.BK_PAAS_ESB_HOST,
+        # BK-Vision 仪表盘配置
+        "BKVISION_SYSTEM_DASHBOARD_UID": env.BKAPP_BKVISION_SYSTEM_DASHBOARD_UID,
+        "BKVISION_SPACE_DASHBOARD_UID": env.BKAPP_BKVISION_SPACE_DASHBOARD_UID,
+        "BKVISION_BASE_URL": env.BKAPP_BKVISION_BASE_URL,
+        "BKVISION_MAIN_JS_SRC_URL": env.BKAPP_BKVISION_MAIN_JS_SRC_URL,
+        "TENANT_ID": getattr(request.user, "tenant_id", ""),
+        "DISPLAY_NAME": getattr(request.user, "display_name", request.user.username),
+        "BK_USER_WEB_APIGW_URL": f"{settings.BK_API_URL_TMPL.format(api_name='bk-user-web')}/"
+        f"{settings.BK_APIGW_STAGE_NAME}",
+        "BKPAAS_USER_URL": settings.BKPAAS_USER_URL,
+        "BK_IAM_SAAS_HOST": settings.BKPAAS_IAM_URL,
+        "ENABLE_MULTI_TENANT_MODE": settings.ENABLE_MULTI_TENANT_MODE,
+        "TIMEZONE": time_zone,
+    }
+    return ctx

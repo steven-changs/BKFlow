@@ -1,0 +1,73 @@
+===================================
+BKFlow 部署 - 下一步操作
+===================================
+
+✅ 已完成:
+1. Python 3.11.15 虚拟环境已创建: D:\program\env\bkflow_env
+2. 所有依赖已安装成功 (Django, Celery, Redis 等)
+3. MySQL 和 Redis 服务运行中
+4. 配置文件已准备: local_settings.py
+5. 启动脚本已创建: scripts/ 目录
+
+📋 接下来需要手动完成:
+
+步骤 1: 创建数据库
+------------------------
+打开 PowerShell 或命令提示符，执行:
+
+mysql -u root -p
+
+然后在 MySQL 中执行:
+
+CREATE DATABASE IF NOT EXISTS bkflow DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'bkflow'@'localhost' IDENTIFIED BY 'bkflow123';
+GRANT ALL PRIVILEGES ON bkflow.* TO 'bkflow'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
+
+或者直接运行 SQL 文件:
+mysql -u root -p < scripts\create-database.sql
+
+
+步骤 2: 执行数据库迁移
+------------------------
+cd D:\program\project\BKFlow
+.\scripts\init-db.ps1
+
+这将:
+- 执行 Django 数据库迁移
+- 创建超级管理员账号
+
+
+步骤 3: 启动服务
+------------------------
+cd D:\program\project\BKFlow
+.\scripts\start-all.ps1
+
+这将在 3 个新窗口中启动:
+- Django 服务器 (http://localhost:8000)
+- Celery Worker
+- Celery Beat
+
+
+===================================
+快速参考
+===================================
+
+配置信息:
+- 虚拟环境: D:\program\env\bkflow_env
+- 数据库: localhost:3306/bkflow
+- 用户名: bkflow
+- 密码: bkflow123
+- Redis: localhost:6379
+
+重要文档:
+- QUICKSTART.md - 快速开始完整指南
+- REFERENCE.md - 常用命令快速参考
+- CHECKLIST.md - 部署检查清单
+- DEPLOYMENT.md - 详细部署文档
+
+故障排查:
+如遇到问题，请查看 CHECKLIST.md 中的故障排查部分
+
+===================================

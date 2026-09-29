@@ -1,0 +1,61 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+from django.contrib import admin
+
+from bkflow.plugin.models import (
+    OpenPluginCatalogIndex,
+    SpaceOpenPluginAvailability,
+    SpacePluginConfig,
+)
+
+
+class SpacePluginConfigAdmin(admin.ModelAdmin):
+    list_display = ("space_id", "config", "create_time", "update_time")
+    search_fields = ("space_id",)
+    ordering = ("-update_time",)
+
+
+class OpenPluginCatalogIndexAdmin(admin.ModelAdmin):
+    list_display = (
+        "space_id",
+        "source_key",
+        "plugin_id",
+        "plugin_name",
+        "plugin_source",
+        "wrapper_version",
+        "latest_version",
+        "status",
+        "update_time",
+    )
+    list_filter = ("status", "source_key", "plugin_source", "wrapper_version")
+    search_fields = ("space_id", "source_key", "plugin_id", "plugin_code", "plugin_name")
+    ordering = ("-update_time",)
+
+
+class SpaceOpenPluginAvailabilityAdmin(admin.ModelAdmin):
+    list_display = ("space_id", "source_key", "plugin_id", "enabled", "create_time", "update_time")
+    list_editable = ("enabled",)
+    list_filter = ("enabled", "source_key")
+    search_fields = ("space_id", "source_key", "plugin_id")
+    ordering = ("-update_time",)
+
+
+admin.site.register(SpacePluginConfig, SpacePluginConfigAdmin)
+admin.site.register(OpenPluginCatalogIndex, OpenPluginCatalogIndexAdmin)
+admin.site.register(SpaceOpenPluginAvailability, SpaceOpenPluginAvailabilityAdmin)

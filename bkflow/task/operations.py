@@ -1,0 +1,1293 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+
+import functools
+import logging
+import traceback
+from contextlib import nullcontext
+from copy import deepcopy
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any, List, Optional
+
+from bamboo_engine import api as bamboo_engine_api
+from bamboo_engine import exceptions as bamboo_engine_exceptions
+from bamboo_engine import exceptions as bamboo_exceptions
+from bamboo_engine import states as bamboo_engine_states
+from bamboo_engine.api import EngineAPIResult
+from bamboo_engine.context import Context
+from bamboo_engine.eri import ContextValue, ContextValueType, ScheduleType
+from bamboo_engine.template import Template
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+from pipeline.component_framework.library import ComponentLibrary
+from pipeline.engine.utils import calculate_elapsed_time
+from pipeline.eri.imp.serializer import SerializerMixin
+from pipeline.eri.models import ExecutionData as DBExecutionData
+from pipeline.eri.models import Schedule as DBSchedule
+from pipeline.eri.runtime import BambooDjangoRuntime
+from pipeline.parser.context import get_pipeline_context
+from pydantic import BaseModel, validator
+
+from bkflow.constants import (
+    PipelineContextObjType,
+    RecordType,
+    TaskOperationSource,
+    TaskOperationType,
+    TaskStates,
+    TaskTriggerMethod,
+)
+from bkflow.contrib.api.collections.interface import InterfaceModuleClient
+from bkflow.contrib.operation_record.decorators import record_operation
+from bkflow.exceptions import ValidationError
+from bkflow.pipeline_plugins.components.collections.uniform_api.credential_handlers import (
+    CredentialKeySpaceConfigHandler,
+    DefaultCredentialHandler,
+    SpaceCredentialHandler,
+)
+from bkflow.pipeline_plugins.query.uniform_api.utils import UniformAPIClient
+from bkflow.pipeline_web.parser.format import format_web_data_to_pipeline
+from bkflow.plugin.services.open_plugin_detect import (
+    get_reference_snapshot,
+    needs_start_validation,
+)
+from bkflow.task.context import SystemObject
+from bkflow.task.models import OpenPluginRunCallbackRef, TaskFlowRelation, TaskInstance
+from bkflow.task.open_plugin_callback import (
+    callback_token_digest,
+    parse_open_plugin_callback_token,
+)
+from bkflow.task.signals.context import suppress_node_failure_side_effects
+from bkflow.task.signals.signals import taskflow_started
+from bkflow.task.utils import format_bamboo_engine_status
+from bkflow.utils.canvas import get_variable_mapping
+from bkflow.utils.dates import format_datetime
+from bkflow.utils.handlers import mask_sensitive_data_for_display
+from bkflow.utils.trace import create_execution_span, start_trace
+
+logger = logging.getLogger("root")
+
+
+class OperationResult(BaseModel):
+    result: bool
+    data: Optional[Any] = None
+    message: str = ""
+    exc: str = None
+    exc_trace: str = None
+
+    @validator("exc", pre=True)
+    def parse_exc(cls, value):
+        if value is not None:
+            return str(value)
+        return value
+
+    class Config:
+        orm_mode = True
+
+
+def uniform_task_operation_result(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+        except Exception as e:
+            msg = f"task operation error: {e}"
+            logger.exception(msg)
+            trace = traceback.format_exc()
+            return OperationResult(result=False, message=msg, exc=str(e), exc_trace=trace)
+
+        if isinstance(result, OperationResult):
+            operation_result = result
+        elif isinstance(result, EngineAPIResult):
+            operation_result = OperationResult.from_orm(result)
+        elif isinstance(result, dict):
+            operation_result = OperationResult(**result)
+        else:
+            operation_result = OperationResult(result=True, data=result)
+        return operation_result
+
+    return wrapper
+
+
+def trace_task_operation(operation_name: str, operation_type: str = "task"):
+    """为任务操作添加 trace span 的装饰器
+
+    :param operation_name: 操作名称，如 'start', 'pause', 'resume' 等
+    :param operation_type: 操作类型，'task' 或 'task_node'，默认为 'task'
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if not settings.ENABLE_OTEL_TRACE:
+                return func(self, *args, **kwargs)
+
+            platform_code = getattr(settings, "PLATFORM_CODE", "bkflow")
+            span_name = f"{platform_code}.{operation_type}.{operation_name}"
+
+            attributes = {
+                "task_id": getattr(self.task_instance, "id", None),
+                "space_id": getattr(self.task_instance, "space_id", None),
+                "operator": kwargs.get("operator") or (args[0] if args else None),
+            }
+
+            if operation_type == "task_node" and hasattr(self, "node_id"):
+                attributes["node_id"] = self.node_id
+
+            with start_trace(span_name=span_name, propagate=False, **attributes):
+                return func(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def _get_open_plugin_callback_ref_model():
+    return OpenPluginRunCallbackRef
+
+
+def _is_open_plugin_callback_data(data):
+    return isinstance(data, dict) and bool(data.get("_callback_token"))
+
+
+def _build_open_plugin_callback_payload(data):
+    callback_payload = {
+        "open_plugin_run_id": data["open_plugin_run_id"],
+        "status": data["status"],
+    }
+    for key in ("outputs", "error_message", "truncated", "truncated_fields"):
+        if key in data:
+            callback_payload[key] = data[key]
+    return callback_payload
+
+
+def _parse_open_plugin_callback_expire_at(token_payload):
+    expire_at = datetime.fromisoformat(token_payload["expire_at"])
+    if timezone.is_naive(expire_at):
+        expire_at = timezone.make_aware(expire_at, timezone.get_current_timezone())
+    return expire_at
+
+
+def _get_open_plugin_space_configs(task_instance: TaskInstance):
+    interface_client = InterfaceModuleClient()
+    params = {
+        "space_id": task_instance.space_id,
+        "config_names": "uniform_api,credential,api_gateway_credential_name",
+    }
+    if task_instance.scope_type and task_instance.scope_value:
+        params["scope"] = f"{task_instance.scope_type}_{task_instance.scope_value}"
+    space_infos_result = interface_client.get_space_infos(params)
+    if not space_infos_result.get("result"):
+        logger.warning(
+            "[open_plugin cancel] get_space_infos failed for task(%s): %s",
+            task_instance.id,
+            space_infos_result.get("message"),
+        )
+        return None
+    return space_infos_result.get("data", {}).get("configs", {})
+
+
+def _get_open_plugin_cancel_credential(task_instance: TaskInstance, space_configs: dict, credential_key: str = ""):
+    handlers = [
+        CredentialKeySpaceConfigHandler(
+            logger=logger,
+            scope_type=task_instance.scope_type,
+            scope_id=task_instance.scope_value,
+            parent_data=SimpleNamespace(inputs={}),
+            space_configs=space_configs,
+        ),
+        SpaceCredentialHandler(
+            logger=logger,
+            scope_type=task_instance.scope_type,
+            scope_id=task_instance.scope_value,
+            parent_data=SimpleNamespace(inputs={}),
+            space_configs=space_configs,
+        ),
+        DefaultCredentialHandler(
+            logger=logger,
+            scope_type=task_instance.scope_type,
+            scope_id=task_instance.scope_value,
+            parent_data=SimpleNamespace(inputs={}),
+            space_configs=space_configs,
+        ),
+    ]
+
+    for handler in handlers:
+        try:
+            if handler.can_handle(credential_key):
+                app_code, app_secret = handler.get_credential(credential_key)
+                if app_code and app_secret:
+                    return app_code, app_secret
+        except Exception as e:
+            logger.warning("[open_plugin cancel] credential handler(%s) failed: %s", handler.get_name(), e)
+
+    return None, None
+
+
+def _cancel_open_plugin_run(task_instance: TaskInstance, callback_ref, operator: str, space_configs: dict):
+    if not callback_ref.cancel_url:
+        logger.warning(
+            "[open_plugin cancel] missing cancel_url for task(%s) node(%s) run(%s)",
+            task_instance.id,
+            callback_ref.node_id,
+            callback_ref.open_plugin_run_id,
+        )
+        return
+
+    app_code, app_secret = _get_open_plugin_cancel_credential(
+        task_instance=task_instance,
+        space_configs=space_configs,
+        credential_key=getattr(callback_ref, "credential_key", ""),
+    )
+    if not app_code or not app_secret:
+        logger.warning(
+            "[open_plugin cancel] no credential for task(%s) node(%s) run(%s)",
+            task_instance.id,
+            callback_ref.node_id,
+            callback_ref.open_plugin_run_id,
+        )
+        return
+
+    client = UniformAPIClient()
+    headers = client.gen_default_apigw_header(app_code=app_code, app_secret=app_secret, username=operator)
+
+    try:
+        request_result = client.request(
+            url=callback_ref.cancel_url,
+            method="POST",
+            data={},
+            headers=headers,
+            timeout=settings.BKAPP_API_PLUGIN_REQUEST_TIMEOUT,
+        )
+    except Exception as e:
+        logger.warning(
+            "[open_plugin cancel] request failed for task(%s) node(%s) run(%s): %s",
+            task_instance.id,
+            callback_ref.node_id,
+            callback_ref.open_plugin_run_id,
+            e,
+        )
+        return
+
+    json_resp = request_result.json_resp or {}
+    if request_result.resp.status_code >= 400 or (isinstance(json_resp, dict) and json_resp.get("result") is False):
+        logger.warning(
+            "[open_plugin cancel] cancel failed for task(%s) node(%s) run(%s): status=%s, message=%s",
+            task_instance.id,
+            callback_ref.node_id,
+            callback_ref.open_plugin_run_id,
+            request_result.resp.status_code,
+            json_resp.get("message") or request_result.message,
+        )
+
+
+def _dispatch_open_plugin_cancellation(task_id: int, operator: str, node_id: str = None):
+    try:
+        from bkflow.task.celery.tasks import cancel_open_plugin_runs
+
+        kwargs = {"task_id": task_id, "operator": operator}
+        if node_id:
+            kwargs["node_id"] = node_id
+        cancel_open_plugin_runs.delay(**kwargs)
+    except Exception:
+        logger.exception(
+            "[open_plugin cancel] dispatch failed for task(%s) node(%s)",
+            task_id,
+            node_id or "all",
+        )
+
+
+class TaskOperation:
+    CREATED_STATUS = {
+        "start_time": None,
+        "state": TaskStates.CREATED.value,
+        "retry": 0,
+        "skip": 0,
+        "finish_time": None,
+        "elapsed_time": 0,
+        "children": {},
+    }
+
+    def __init__(self, task_instance: TaskInstance, queue: str = None, *args, **kwargs):
+        self.task_instance = task_instance
+        self.queue = queue
+
+    def _revoke_debug_descendants(self, operator: str, node_id: str = None):
+        """撤销 DEBUG 根任务创建的子画布/子流程任务，最深层子任务优先。"""
+        if self.task_instance.create_method != "DEBUG":
+            return
+
+        relations = list(
+            TaskFlowRelation.objects.filter(root_task_id=self.task_instance.id).values(
+                "task_id", "parent_task_id", "extra_info"
+            )
+        )
+        children_by_parent = {}
+        for relation in relations:
+            children_by_parent.setdefault(relation["parent_task_id"], []).append(relation)
+
+        direct_relations = children_by_parent.get(self.task_instance.id, [])
+        if node_id:
+            direct_relations = [
+                relation
+                for relation in direct_relations
+                if (relation.get("extra_info") or {}).get("node_id") == node_id
+            ]
+
+        descendants = []
+        pending = [(relation, 1) for relation in direct_relations]
+        visited = set()
+        while pending:
+            relation, depth = pending.pop(0)
+            task_id = relation["task_id"]
+            if task_id in visited:
+                continue
+            visited.add(task_id)
+            descendants.append((task_id, depth))
+            pending.extend((child, depth + 1) for child in children_by_parent.get(task_id, []))
+
+        active_tasks = {
+            task.id: task
+            for task in TaskInstance.objects.filter(
+                id__in=[task_id for task_id, _ in descendants],
+                is_finished=False,
+                is_revoked=False,
+                is_expired=False,
+                is_deleted=False,
+            )
+        }
+        for task_id, _ in sorted(descendants, key=lambda item: item[1], reverse=True):
+            child_task = active_tasks.get(task_id)
+            if child_task is None:
+                continue
+            result = TaskOperation(task_instance=child_task, queue=self.queue).revoke(
+                operator=operator,
+                cascade_debug_descendants=False,
+            )
+            if not result.result:
+                logger.warning(
+                    "[debug revoke] revoke child task failed, root_task_id=%s, child_task_id=%s, message=%s",
+                    self.task_instance.id,
+                    task_id,
+                    result.message,
+                )
+
+    def _ensure_open_plugins_ready_for_start(self):
+        """仅对包含开放插件快照或 V4 节点的任务请求 Interface 做启动预检。"""
+        extra_info = self.task_instance.extra_info or {}
+        pipeline_tree = self.task_instance.execution_data or {}
+        if not needs_start_validation(extra_info=extra_info, pipeline_tree=pipeline_tree):
+            return
+        snapshot = get_reference_snapshot(extra_info)
+        payload = {"space_id": self.task_instance.space_id}
+        if snapshot:
+            payload["snapshot"] = snapshot
+        else:
+            payload["pipeline_tree"] = pipeline_tree
+        result = InterfaceModuleClient().validate_open_plugins_for_start(payload)
+        if not result.get("result"):
+            raise ValidationError(result.get("message") or "开放插件启动预检失败")
+
+    @trace_task_operation("start")
+    @record_operation(RecordType.task.name, TaskOperationType.start.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def start(self, operator: str, *args, **kwargs) -> OperationResult:
+        self._ensure_open_plugins_ready_for_start()
+        # CAS
+        update_success = TaskInstance.objects.filter(id=self.task_instance.id, is_started=False).update(
+            start_time=timezone.now(), is_started=True, executor=operator
+        )
+        self.task_instance.calculate_tree_info()
+
+        if not update_success:
+            raise ValidationError("task already started")
+
+        try:
+            self.task_instance.refresh_from_db()
+            # convert web pipeline to pipeline
+            pipeline = format_web_data_to_pipeline(self.task_instance.execution_data)
+            root_pipeline_context = {}
+            root_pipeline_data = get_pipeline_context(
+                self.task_instance, obj_type=PipelineContextObjType.instance.value, username=operator
+            )
+            if self.task_instance.trigger_method != TaskTriggerMethod.sub_canvas.name:
+                system_obj = SystemObject(root_pipeline_data)
+                root_pipeline_context.update({"${_system}": system_obj})
+                # 获取空间变量
+                space_var = InterfaceModuleClient().get_variable(self.task_instance.space_id)
+                if not space_var.get("result"):
+                    logger.error("get space variable failed: %s", space_var.get("message"))
+                    space_var_data = {}
+                else:
+                    space_var_data = space_var.get("data", {})
+                root_pipeline_context.update(space_var_data)
+
+            # 创建执行级根 Span，将 trace context 注入 pipeline data，
+            # 后续插件 Span 通过这些 ID 建立父子关系
+            if settings.ENABLE_OTEL_TRACE:
+                try:
+                    extra_info = self.task_instance.extra_info or {}
+                    custom_context = extra_info.get("custom_context", {}) or {}
+                    custom_span_attributes = custom_context.get("custom_span_attributes", {}) or {}
+                    if not isinstance(custom_span_attributes, dict):
+                        custom_span_attributes = {}
+                    trace_id, execution_span_id = create_execution_span(
+                        task_id=self.task_instance.id,
+                        space_id=self.task_instance.space_id,
+                        pipeline_instance_id=self.task_instance.instance_id,
+                        operator=operator,
+                        custom_span_attributes=custom_span_attributes,
+                    )
+                    if trace_id and execution_span_id:
+                        root_pipeline_data["_trace_id"] = trace_id
+                        root_pipeline_data["_parent_span_id"] = execution_span_id
+                except Exception as e:
+                    logger.warning(f"[plugin_span] Failed to create execution span: {e}")
+
+            # run pipeline
+            result = bamboo_engine_api.run_pipeline(
+                runtime=BambooDjangoRuntime(),
+                pipeline=pipeline,
+                root_pipeline_data=root_pipeline_data,
+                root_pipeline_context=root_pipeline_context,
+                subprocess_context=root_pipeline_context,
+                queue=self.queue,
+                cycle_tolerate=True,
+            )
+        except Exception as e:
+            logger.exception(f"run pipeline failed: {e}")
+            TaskInstance.objects.filter(id=self.task_instance.id, is_started=True).update(
+                start_time=None,
+                is_started=False,
+                executor="",
+            )
+            raise
+
+        if not result.result:
+            TaskInstance.objects.filter(id=self.task_instance.id, is_started=True).update(
+                start_time=None,
+                is_started=False,
+                executor="",
+            )
+            logger.error("run_pipeline fail: {}, exception: {}".format(result.message, result.exc_trace))
+        else:
+            taskflow_started.send(sender=self.__class__, task_id=self.task_instance.id)
+
+        return result
+
+    @trace_task_operation("pause")
+    @record_operation(RecordType.task.name, TaskOperationType.pause.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def pause(self, operator: str, *args, **kwargs) -> OperationResult:
+        return bamboo_engine_api.pause_pipeline(
+            runtime=BambooDjangoRuntime(), pipeline_id=self.task_instance.instance_id
+        )
+
+    @trace_task_operation("resume")
+    @record_operation(RecordType.task.name, TaskOperationType.resume.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def resume(self, operator: str, *args, **kwargs) -> OperationResult:
+        return bamboo_engine_api.resume_pipeline(
+            runtime=BambooDjangoRuntime(), pipeline_id=self.task_instance.instance_id
+        )
+
+    @trace_task_operation("revoke")
+    @record_operation(RecordType.task.name, TaskOperationType.revoke.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def revoke(self, operator: str, *args, **kwargs) -> OperationResult:
+        result = bamboo_engine_api.revoke_pipeline(
+            runtime=BambooDjangoRuntime(), pipeline_id=self.task_instance.instance_id
+        )
+        if result.result:
+            _dispatch_open_plugin_cancellation(task_id=self.task_instance.id, operator=operator)
+            if kwargs.get("cascade_debug_descendants", True):
+                self._revoke_debug_descendants(operator=operator)
+        return result
+
+    @uniform_task_operation_result
+    def get_task_states(
+        self,
+        subprocess_id: str = None,
+        with_ex_data: bool = False,
+        include_schedule: bool = False,
+        *args,
+        **kwargs,
+    ) -> OperationResult:
+        if self.task_instance.is_expired:
+            return OperationResult(result=True, data={"state": TaskStates.EXPIRED.value})
+        if not self.task_instance.is_started:
+            return OperationResult(result=True, data=self.CREATED_STATUS)
+
+        runtime = BambooDjangoRuntime()
+        state_result = bamboo_engine_api.get_pipeline_states(
+            runtime=runtime, root_id=self.task_instance.instance_id, flat_children=False
+        )
+        if not state_result.result:
+            logger.error(
+                "get_pipeline_states fail: {}, exception: {}".format(state_result.message, state_result.exc_trace)
+            )
+            return state_result
+
+        task_states = state_result.data
+        if not task_states:
+            return OperationResult(result=True, data={"state": TaskStates.CREATED.value})
+        task_states = task_states[self.task_instance.instance_id]
+
+        def get_subprocess_states(states) -> dict:
+            for child in states["children"].values():
+                if child["id"] == subprocess_id:
+                    return child
+                if child["children"]:
+                    status = get_subprocess_states(child)
+                    if status is not None:
+                        return status
+
+        if subprocess_id:
+            task_states = get_subprocess_states(task_states)
+
+        # subprocess not been executed
+        task_states = task_states or TaskStates.CREATED.value
+
+        def _format_status_time(status_tree):
+            status_tree.setdefault("children", {})
+            status_tree.pop("created_time", "")
+            started_time = status_tree.pop("started_time", None)
+            archived_time = status_tree.pop("archived_time", None)
+
+            if "elapsed_time" not in status_tree:
+                status_tree["elapsed_time"] = calculate_elapsed_time(started_time, archived_time)
+
+            status_tree["start_time"] = format_datetime(started_time) if started_time else ""
+            status_tree["finish_time"] = format_datetime(archived_time) if archived_time else ""
+
+        def format_bamboo_engine_status(status_tree):
+            """
+            @summary: 转换通过 bamboo engine api 获取的任务状态格式
+            @return:
+            """
+            _format_status_time(status_tree)
+            child_status = set()
+            for identifier_code, child_tree in list(status_tree["children"].items()):
+                format_bamboo_engine_status(child_tree)
+                child_status.add(child_tree["state"])
+
+            if status_tree["state"] == bamboo_engine_states.RUNNING:
+                if bamboo_engine_states.FAILED in child_status:
+                    status_tree["state"] = bamboo_engine_states.FAILED
+                elif bamboo_engine_states.SUSPENDED in child_status:
+                    status_tree["state"] = "NODE_SUSPENDED"
+
+        format_bamboo_engine_status(task_states)
+
+        if include_schedule:
+            nodes = []
+
+            def collect_nodes(status_tree):
+                for child in status_tree.get("children", {}).values():
+                    nodes.append(child)
+                    collect_nodes(child)
+
+            collect_nodes(task_states)
+            node_versions = {(node.get("id"), node.get("version")) for node in nodes}
+            node_ids = {node_id for node_id, _ in node_versions if node_id}
+            schedules = DBSchedule.objects.filter(node_id__in=node_ids, finished=False, expired=False).values(
+                "node_id", "version", "type"
+            )
+            schedule_types = {}
+            for schedule in schedules:
+                try:
+                    schedule_type = ScheduleType(schedule["type"]).name
+                except ValueError:
+                    continue
+                schedule_types[(schedule["node_id"], schedule["version"])] = schedule_type
+            for node in nodes:
+                schedule_type = schedule_types.get((node.get("id"), node.get("version")))
+                if schedule_type:
+                    node["schedule_type"] = schedule_type
+                    continue
+                if node.get("state") != bamboo_engine_states.RUNNING or not node.get("id"):
+                    continue
+                try:
+                    if not runtime.get_sleep_process_info_with_current_node_id(node["id"]):
+                        continue
+                    engine_node = runtime.get_node(node["id"])
+                    service = runtime.get_service(
+                        code=engine_node.code,
+                        version=engine_node.version,
+                        name=engine_node.name,
+                    )
+                    inferred_type = service.schedule_type()
+                    if inferred_type:
+                        node["schedule_type"] = inferred_type.name
+                except Exception:
+                    logger.warning(
+                        "[get_task_states] infer schedule type failed, node_id=%s",
+                        node["id"],
+                        exc_info=True,
+                    )
+
+        def collect_fail_nodes(task_status: dict) -> list:
+            task_status["ex_data"] = {}
+            children_list = [task_status["children"]]
+            failed_nodes = []
+            while len(children_list) > 0:
+                children = children_list.pop(0)
+                for _, node in children.items():
+                    if node["state"] == bamboo_engine_states.FAILED:
+                        if len(node["children"]) > 0:
+                            children_list.append(node["children"])
+                            continue
+                        failed_nodes.append(node["id"])
+            return failed_nodes
+
+        # 返回失败节点和对应调试信息
+        if with_ex_data and task_states["state"] == bamboo_engine_states.FAILED:
+            fail_nodes = collect_fail_nodes(task_states)
+            task_states["ex_data"] = {}
+            for node_id in fail_nodes:
+                data_result = bamboo_engine_api.get_execution_data_outputs(runtime=runtime, node_id=node_id)
+
+                if not data_result:
+                    task_states["ex_data"][node_id] = "get ex_data fail: {}".format(data_result.exc)
+                else:
+                    task_states["ex_data"][node_id] = data_result.data.get("ex_data")
+
+        return OperationResult(result=True, data=task_states)
+
+    @uniform_task_operation_result
+    def render_current_constants(self):
+        runtime = BambooDjangoRuntime()
+        context_values = runtime.get_context(self.task_instance.instance_id)
+        try:
+            root_pipeline_inputs = {
+                key: di.value for key, di in runtime.get_data_inputs(self.task_instance.instance_id).items()
+            }
+        except bamboo_engine_exceptions.NotFoundError:
+            return OperationResult(result=False, message="data not found, task is not running")
+        context = Context(runtime, context_values, root_pipeline_inputs)
+
+        try:
+            hydrated_context = context.hydrate()
+        except Exception as e:
+            logger.exception("[render_current_constants] hydrate context failed: {}".format(e))
+            return OperationResult(
+                result=False, message="hydrate context failed.", exc=e, exc_trace=traceback.format_exc()
+            )
+
+        # 对渲染后的上下文进行脱敏处理（如 credentials）
+        masked_context = mask_sensitive_data_for_display(hydrated_context)
+        data = [{"key": key, "value": value} for key, value in masked_context.items()]
+        return OperationResult(result=True, data=data)
+
+    @uniform_task_operation_result
+    def render_context_with_node_outputs(self, node_ids: List[str], to_render_constants):
+        runtime = BambooDjangoRuntime()
+        context_values = runtime.get_context(self.task_instance.instance_id)
+        constants = self.task_instance.pipeline_tree.get("constants", {})
+
+        context_dict = {cv.key: cv for cv in context_values}
+
+        # 构建节点输出变量的映射关系
+        node_outputs = {}
+        node_id_constants_map = get_variable_mapping(constants, set(node_ids))
+
+        # 获取节点输出数据
+        nodes = DBExecutionData.objects.filter(node_id__in=node_ids).iterator()
+
+        # 反序列化节点输出
+        nodes_data = {}
+        for node in nodes:
+            try:
+                nodes_data[node.node_id] = SerializerMixin()._deserialize(node.outputs, node.outputs_serializer)
+            except Exception as e:
+                logger.exception(
+                    "[render_context] Failed to deserialize node outputs: node_id=%s, error=%s", node.node_id, str(e)
+                )
+                continue
+
+        # 根据映射关系构建最终的输出数据
+        for node_id, node_data in nodes_data.items():
+            node_mapping = node_id_constants_map.get(node_id, {})
+            for original_key, value in node_data.items():
+                if mapped_key := node_mapping.get(original_key):
+                    node_outputs[mapped_key] = value
+
+        for key, value in node_outputs.items():
+            if key not in context_dict:
+                context_dict[key] = ContextValue(key=key, type=ContextValueType.PLAIN, value=value, code=None)
+            elif value != context_dict[key].value:
+                context_dict[key].value = value
+
+        # 转换回列表
+        context_values = list(context_dict.values())
+
+        try:
+            context = Context(runtime, context_values, to_render_constants)
+            hydrated_context = context.hydrate(deformat=True)
+            hydrated_param_data = Template(to_render_constants).render(hydrated_context)
+        except Exception as e:
+            logger.exception("[render_context_with_node_outputs] hydrate context failed: %s", e)
+            return OperationResult(
+                result=False, message="hydrate context failed.", exc=e, exc_trace=traceback.format_exc()
+            )
+
+        # 对渲染后的参数数据进行脱敏处理（如 credentials）
+        masked_param_data = mask_sensitive_data_for_display(hydrated_param_data)
+        return OperationResult(
+            result=True, data=[{"key": key, "value": value} for key, value in masked_param_data.items()]
+        )
+
+
+class TaskNodeOperation:
+    def __init__(self, task_instance: TaskInstance, node_id: str, *args, **kwargs):
+        self.task_instance = task_instance
+        self.node_id = node_id
+        self.runtime = BambooDjangoRuntime()
+
+    @trace_task_operation("retry", operation_type="task_node")
+    @record_operation(RecordType.task_node.name, TaskOperationType.retry.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def retry(self, operator: str, *args, **kwargs) -> OperationResult:
+        api_result = bamboo_engine_api.get_data(runtime=self.runtime, node_id=self.node_id)
+        if not api_result.result:
+            return api_result
+        loop_retry = kwargs.get("loop", False)
+        return bamboo_engine_api.retry_node(
+            runtime=self.runtime, node_id=self.node_id, data=kwargs.get("inputs") or None, loop_retry=loop_retry
+        )
+
+    @trace_task_operation("skip", operation_type="task_node")
+    @record_operation(RecordType.task_node.name, TaskOperationType.skip.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def skip(self, operator: str, *args, **kwargs) -> OperationResult:
+        loop_skip = kwargs.get("loop", False)
+        return bamboo_engine_api.skip_node(runtime=self.runtime, node_id=self.node_id, loop_skip=loop_skip)
+
+    def _handle_open_plugin_callback(self, data) -> OperationResult:
+        callback_data = deepcopy(data)
+        callback_token = callback_data.pop("_callback_token", "")
+        if not callback_token:
+            return OperationResult(result=False, message="missing callback token")
+
+        try:
+            token_payload = parse_open_plugin_callback_token(callback_token)
+            expire_at = _parse_open_plugin_callback_expire_at(token_payload)
+        except Exception:
+            return OperationResult(result=False, message="invalid callback token")
+
+        if expire_at <= timezone.now():
+            return OperationResult(result=False, message="callback token expired")
+
+        with transaction.atomic():
+            callback_ref = (
+                OpenPluginRunCallbackRef.objects.select_for_update()
+                .filter(
+                    task_id=self.task_instance.id,
+                    node_id=self.node_id,
+                    open_plugin_run_id=callback_data["open_plugin_run_id"],
+                )
+                .first()
+            )
+            if callback_ref is None:
+                return OperationResult(result=False, message="callback token does not match open plugin run")
+
+            if callback_ref.callback_token_digest != callback_token_digest(callback_token):
+                return OperationResult(result=False, message="callback token verification failed")
+            if callback_ref.callback_expire_at <= timezone.now():
+                return OperationResult(result=False, message="callback token expired")
+            if int(token_payload["task_id"]) != int(self.task_instance.id) or token_payload["node_id"] != self.node_id:
+                return OperationResult(result=False, message="callback token does not match task node")
+            if token_payload["client_request_id"] != callback_ref.client_request_id:
+                return OperationResult(result=False, message="callback token does not match client request")
+            if token_payload.get("node_version", "") != callback_ref.node_version:
+                return OperationResult(result=False, message="callback token does not match node version")
+            if callback_ref.consumed_at:
+                return OperationResult(result=True, message="open plugin callback already consumed")
+
+            runtime = BambooDjangoRuntime()
+            node_state = runtime.get_state(self.node_id)
+            if node_state.name not in [bamboo_engine_states.RUNNING, bamboo_engine_states.FAILED]:
+                callback_ref.consumed_at = timezone.now()
+                callback_ref.save(update_fields=["consumed_at", "update_time"])
+                return OperationResult(result=True, message="node already in terminal state")
+            if node_state.version != callback_ref.node_version:
+                callback_ref.consumed_at = timezone.now()
+                callback_ref.save(update_fields=["consumed_at", "update_time"])
+                return OperationResult(result=True, message="node version already changed")
+
+            result = bamboo_engine_api.callback(
+                runtime=runtime,
+                node_id=self.node_id,
+                version=callback_ref.node_version,
+                data=_build_open_plugin_callback_payload(callback_data),
+            )
+            if result.result:
+                callback_ref.consumed_at = timezone.now()
+                callback_ref.save(update_fields=["consumed_at", "update_time"])
+            return result
+
+    @trace_task_operation("callback", operation_type="task_node")
+    @record_operation(RecordType.task_node.name, TaskOperationType.callback.name, TaskOperationSource.api.name)
+    @uniform_task_operation_result
+    def callback(self, operator: str, *args, **kwargs) -> OperationResult:
+        callback_data = kwargs["data"]
+        if _is_open_plugin_callback_data(callback_data):
+            return self._handle_open_plugin_callback(callback_data)
+
+        runtime = BambooDjangoRuntime()
+        version = kwargs.get("version")
+        if not version:
+            version = runtime.get_state(self.node_id).version
+        return bamboo_engine_api.callback(runtime=runtime, node_id=self.node_id, version=version, data=kwargs["data"])
+
+    @trace_task_operation("skip_exg", operation_type="task_node")
+    @record_operation(RecordType.task_node.name, TaskOperationType.skip_exg.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def skip_exg(self, operator: str, *args, **kwargs) -> OperationResult:
+        return bamboo_engine_api.skip_exclusive_gateway(
+            runtime=self.runtime, node_id=self.node_id, flow_id=kwargs["flow_id"]
+        )
+
+    @trace_task_operation("skip_cpg", operation_type="task_node")
+    @record_operation(RecordType.task_node.name, TaskOperationType.skip_cpg.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def skip_cpg(self, operator: str, *args, **kwargs) -> OperationResult:
+        return bamboo_engine_api.skip_conditional_parallel_gateway(
+            runtime=self.runtime,
+            node_id=self.node_id,
+            flow_ids=kwargs["flow_ids"],
+            converge_gateway_id=kwargs["converge_gateway_id"],
+        )
+
+    @trace_task_operation("forced_fail", operation_type="task_node")
+    @record_operation(RecordType.task_node.name, TaskOperationType.forced_fail.name, TaskOperationSource.app.name)
+    @uniform_task_operation_result
+    def forced_fail(self, operator: str, *args, **kwargs) -> OperationResult:
+        suppress_side_effects = kwargs.get("suppress_failure_side_effects", False)
+        if suppress_side_effects and self.task_instance.create_method != "DEBUG":
+            suppress_side_effects = False
+
+        if suppress_side_effects:
+            suppression = suppress_node_failure_side_effects(self.task_instance.instance_id, self.node_id)
+        else:
+            suppression = nullcontext()
+
+        with suppression:
+            result = bamboo_engine_api.forced_fail_activity(
+                runtime=self.runtime,
+                node_id=self.node_id,
+                ex_data=kwargs.get("ex_data", f"forced fail by {operator}"),
+                send_post_set_state_signal=kwargs.get("send_post_set_state_signal", True),
+            )
+        if result.result:
+            _dispatch_open_plugin_cancellation(
+                task_id=self.task_instance.id,
+                node_id=self.node_id,
+                operator=operator,
+            )
+            TaskOperation(task_instance=self.task_instance)._revoke_debug_descendants(
+                operator=operator,
+                node_id=self.node_id,
+            )
+        return result
+
+    @trace_task_operation("get_node_detail", operation_type="task_node")
+    @uniform_task_operation_result
+    def get_node_detail(
+        self,
+        subprocess_stack: List[str] = None,
+        component_code: Optional[str] = None,
+        loop: Optional[int] = None,
+        *args,
+        **kwargs,
+    ) -> OperationResult:
+        if subprocess_stack is None:
+            subprocess_stack = []
+
+        runtime = BambooDjangoRuntime()
+        result = bamboo_engine_api.get_children_states(runtime=runtime, node_id=self.node_id)
+        if not result.result:
+            return result
+
+        detail = result.data
+        # 节点已经执行
+        if detail:
+            detail = detail[self.node_id]
+            # 默认只请求最后一次循环结果
+            format_bamboo_engine_status(detail)
+            node_info = self.runtime.get_node(self.node_id)
+            if loop is None or int(loop) >= detail["loop"]:
+                loop = detail["loop"] if not node_info.loop_enabled else -1
+                hist_result = bamboo_engine_api.get_node_histories(runtime=runtime, node_id=self.node_id, loop=loop)
+                if not hist_result:
+                    logger.exception("bamboo_engine_api.get_node_histories fail")
+                    return hist_result
+                for hist in hist_result.data:
+                    hist["ex_data"] = hist.get("outputs", {}).get("ex_data", "")
+                detail["histories"] = hist_result.data
+                detail["history_id"] = -1
+            # 如果用户传了 loop 参数，并且 loop 小于当前节点已循环次数，则从历史数据获取结果
+            else:
+                hist_result = bamboo_engine_api.get_node_histories(runtime=runtime, node_id=self.node_id, loop=loop)
+                if not hist_result:
+                    logger.exception("bamboo_engine_api.get_node_histories fail")
+                    return hist_result
+                self._assemble_history_detail(detail=detail, histories=hist_result.data)
+                detail["history_id"] = hist_result.data[-1]["id"]
+                detail["version"] = hist_result.data[-1]["version"]
+
+            if node_info.loop_enabled and detail.get("histories"):
+                retry_max_loop = {detail["retry"]: detail["loop"]}
+                for h in detail["histories"]:
+                    retry = h.get("retry", 0)
+                    retry_max_loop[retry] = max(retry_max_loop.get(retry, 0), h.get("loop", 0))
+                for hist in detail["histories"]:
+                    hist["outputs"]["_loop"] = retry_max_loop[hist.get("retry", 0)]
+
+            for hist in detail["histories"]:
+                raw_inputs = hist["inputs"].get("subprocess")
+                raw_outputs = hist["outputs"]
+                if settings.PLUGIN_LOOP_OUTPUTS_KEY in raw_outputs:
+                    raw_outputs.pop(settings.PLUGIN_LOOP_OUTPUTS_KEY)
+                outputs = {"outputs": raw_outputs, "ex_data": raw_outputs.get("ex_data")}
+                if raw_inputs:
+                    inputs = raw_inputs["constants"]
+                    inputs = {key[2:-1]: value.get("value") for key, value in inputs.items()}
+                    hist["inputs"] = inputs
+
+                # 重试记录必然是因为失败才重试，设置了循环策略的节点只有成功才能接着循环
+                if node_info.loop_enabled:
+                    if hist["skip"] or hist["outputs"].get("_result"):
+                        state = bamboo_engine_states.FINISHED
+                    else:
+                        state = bamboo_engine_states.FAILED
+                else:
+                    state = bamboo_engine_states.FAILED
+                success, err, outputs_table = self._format_outputs(
+                    outputs=outputs,
+                    component_code=component_code,
+                    subprocess_stack=subprocess_stack,
+                )
+                if not success:
+                    return OperationResult(result=False, data={}, message=err)
+                hist["outputs"] = outputs_table
+                hist.setdefault("state", state)
+                hist["history_id"] = hist["id"]
+                format_bamboo_engine_status(hist)
+        # 节点未执行
+        else:
+            node = self._get_node_info(
+                node_id=self.node_id, pipeline=self.task_instance.execution_data, subprocess_stack=subprocess_stack
+            )
+            detail.update(
+                {
+                    "name": node["name"],
+                    "error_ignorable": node.get("error_ignorable", False),
+                    "state": bamboo_engine_states.READY,
+                }
+            )
+
+        return OperationResult(result=True, data=detail)
+
+    @uniform_task_operation_result
+    def get_outputs(self, *args, **kwargs) -> OperationResult:
+        runtime = BambooDjangoRuntime()
+        outputs_result = bamboo_engine_api.get_execution_data_outputs(runtime=runtime, node_id=self.node_id)
+        if not outputs_result.result:
+            logger.error(f"get_outputs failed: {outputs_result.message}, exc: {outputs_result.exc}")
+        return outputs_result
+
+    @uniform_task_operation_result
+    def get_node_outputs(self, *args, **kwargs):
+        runtime = BambooDjangoRuntime()
+        outputs_data = []
+        outputs_result = bamboo_engine_api.get_execution_data_outputs(runtime=runtime, node_id=self.node_id)
+        if not outputs_result.result:
+            logger.error(f"get_outputs failed: {outputs_result.message}, exc: {outputs_result.exc}")
+            return outputs_result
+        if settings.PLUGIN_LOOP_OUTPUTS_KEY in outputs_result.data:
+            outputs_result.data.pop(settings.PLUGIN_LOOP_OUTPUTS_KEY)
+        outputs_data.append(outputs_result.data)
+        hist_result = bamboo_engine_api.get_node_histories(runtime=runtime, node_id=self.node_id)
+        for hist in hist_result.data:
+            his_outputs = hist["outputs"]
+            if settings.PLUGIN_LOOP_OUTPUTS_KEY in his_outputs:
+                his_outputs.pop(settings.PLUGIN_LOOP_OUTPUTS_KEY)
+            outputs_data.append(his_outputs)
+        return outputs_data
+
+    @uniform_task_operation_result
+    def get_node_data(
+        self,
+        username: str,
+        subprocess_stack: List[str],
+        component_code: Optional[str] = None,
+        loop: Optional[int] = None,
+        include_loop_outputs: bool = False,
+        *args,
+        **kwargs,
+    ) -> OperationResult:
+        runtime = BambooDjangoRuntime()
+        result = bamboo_engine_api.get_children_states(runtime=runtime, node_id=self.node_id)
+        if not result.result:
+            logger.exception("bamboo_engine_api.get_children_states fail")
+            return result
+
+        state = result.data
+        # 已执行的节点直接获取执行数据
+        inputs = {}
+        outputs_wrapper = {}
+        node_info = self._get_node_info(
+            node_id=self.node_id, pipeline=self.task_instance.execution_data, subprocess_stack=subprocess_stack
+        )
+        node_code = node_info.get("component", {}).get("code")
+        if state:
+            # 获取最新的执行数据
+            if loop is None or int(loop) >= state[self.node_id]["loop"]:
+                result = bamboo_engine_api.get_execution_data(runtime=runtime, node_id=self.node_id)
+                if not result.result:
+                    logger.exception("bamboo_engine_api.get_execution_data fail")
+                    # 对上层屏蔽执行数据不存在的场景
+                    if isinstance(result.exc, bamboo_exceptions.NotFoundError):
+                        return OperationResult(
+                            result=True, data={"inputs": {}, "outputs": [], "ex_data": ""}, message=""
+                        )
+                    return result
+
+                data = result.data
+                if node_info["type"] == "SubProcess":
+                    # remove prefix '${' and subfix '}' in subprocess execution input
+                    inputs = {k[2:-1]: v for k, v in data["inputs"].items()}
+                elif node_info["type"] == "ServiceActivity" and node_code == "subprocess_plugin":
+                    raw_inputs = data["inputs"]["subprocess"]["constants"]
+                    inputs = {key[2:-1]: value.get("value") for key, value in raw_inputs.items()}
+                else:
+                    inputs = data["inputs"]
+                raw_outputs = data["outputs"]
+                outputs_wrapper = {"outputs": raw_outputs, "ex_data": raw_outputs.get("ex_data")}
+            # 读取历史记录
+            else:
+                result = bamboo_engine_api.get_node_histories(runtime=runtime, node_id=self.node_id, loop=loop)
+                if not result.result:
+                    logger.exception("bamboo_engine_api.get_node_histories fail")
+                    return result
+
+                hist = result.data
+                if hist:
+                    inputs = hist[-1]["inputs"]
+                    raw_outputs = hist[-1]["outputs"]
+                    outputs_wrapper = {"outputs": raw_outputs, "ex_data": raw_outputs.get("ex_data")}
+
+            if not include_loop_outputs and settings.PLUGIN_LOOP_OUTPUTS_KEY in outputs_wrapper["outputs"]:
+                outputs_wrapper["outputs"].pop(settings.PLUGIN_LOOP_OUTPUTS_KEY)
+
+        # 未执行节点需要实时渲染
+        else:
+            if node_info["type"] not in {"ServiceActivity", "SubProcess"}:
+                return OperationResult(result=True, data={"inputs": {}, "outputs": [], "ex_data": ""}, message="")
+            try:
+                root_pipeline_data = get_pipeline_context(
+                    self.task_instance, obj_type="instance", data_type="data", username=username
+                )
+                # 补充系统变量
+                system_obj = SystemObject(root_pipeline_data)
+                root_pipeline_context = {"${_system}": {"type": "plain", "value": system_obj}}
+                # 补充空间变量
+                space_var = InterfaceModuleClient().get_variable(self.task_instance.space_id)
+                root_pipeline_context.update(
+                    {key: {"type": "plain", "value": value} for key, value in space_var["data"].items()}
+                )
+                existing_context_values = runtime.get_context(self.task_instance.instance_id)
+                root_pipeline_context.update(
+                    {
+                        context_value.key: {"type": "plain", "value": context_value.value}
+                        for context_value in existing_context_values
+                        if context_value.type == ContextValueType.PLAIN
+                    }
+                )
+
+                formatted_pipeline = format_web_data_to_pipeline(self.task_instance.execution_data)
+                preview_result = bamboo_engine_api.preview_node_inputs(
+                    runtime=runtime,
+                    pipeline=formatted_pipeline,
+                    node_id=self.node_id,
+                    subprocess_stack=subprocess_stack,
+                    root_pipeline_data=root_pipeline_data,
+                    parent_params=root_pipeline_context,
+                )
+
+                if not preview_result.result:
+                    message = f"节点数据请求失败: 请重试, 如多次失败可联系管理员处理. {preview_result.exc}"
+                    logger.error(message)
+                    return OperationResult(result=False, data={}, message=message)
+
+                if node_info["type"] == "SubProcess":
+                    # remove prefix '${' and subfix '}' in subprocess execution input
+                    inputs = {k[2:-1]: v for k, v in preview_result.data.items()}
+                elif node_info["type"] == "ServiceActivity" and node_code == "subprocess_plugin":
+                    raw_inputs = preview_result.data["subprocess"]["constants"]
+                    inputs = {k[2:-1]: v.get("value") for k, v in raw_inputs.items()}
+                else:
+                    inputs = preview_result.data
+
+            except Exception as err:
+                return OperationResult(result=False, data={}, message=err)
+
+        # 根据传入的 component_code 对输出进行格式化
+        success, err, outputs_table = self._format_outputs(
+            outputs=outputs_wrapper,
+            component_code=component_code,
+            subprocess_stack=subprocess_stack,
+        )
+        if not success:
+            return OperationResult(result=False, data={}, message=err)
+
+        # 对 inputs 中的敏感信息进行脱敏处理（如 credentials）
+        masked_inputs = mask_sensitive_data_for_display(inputs)
+        data = {"inputs": masked_inputs, "outputs": outputs_table, "ex_data": outputs_wrapper.pop("ex_data", "")}
+        return OperationResult(result=True, data=data, message="")
+
+    @staticmethod
+    def _assemble_history_detail(detail: dict, histories: list):
+        # index 为 -1 表示当前 loop 的最新一次重试执行，历史 loop 最终状态一定是 FINISHED
+        # deepcopy 是为了不在 format_pipeline_status 中修改原数据
+        current_loop = deepcopy(histories[-1])
+        current_loop["state"] = bamboo_engine_states.FINISHED
+        format_bamboo_engine_status(current_loop)
+        detail.update(
+            {
+                "start_time": current_loop["start_time"],
+                "finish_time": current_loop["finish_time"],
+                "elapsed_time": current_loop["elapsed_time"],
+                "loop": current_loop["loop"],
+                "skip": current_loop["skip"],
+                "state": current_loop["state"],
+            }
+        )
+        # index 非 -1 表示当前 loop 的重试记录
+        detail["histories"] = histories[:-1]
+
+    @staticmethod
+    def _get_node_info(node_id: str, pipeline: dict, subprocess_stack: Optional[list] = None) -> dict:
+        subprocess_stack = subprocess_stack or []
+
+        def get_node_info(pipeline: dict, subprocess_stack: list) -> dict:
+            # go deeper
+            if subprocess_stack:
+                return get_node_info(pipeline["activities"][subprocess_stack[0]]["pipeline"], subprocess_stack[1:])
+
+            nodes = {
+                pipeline["start_event"]["id"]: pipeline["start_event"],
+                pipeline["end_event"]["id"]: pipeline["end_event"],
+            }
+            nodes.update(pipeline["activities"])
+            nodes.update(pipeline["gateways"])
+            return nodes[node_id]
+
+        return get_node_info(pipeline, subprocess_stack)
+
+    def _format_outputs(
+        self,
+        outputs: dict,
+        component_code: str,
+        subprocess_stack: Optional[list] = None,
+    ) -> (bool, str, list):
+        outputs_table = []
+        if component_code:
+            try:
+                version = (
+                    self._get_node_info(self.node_id, self.task_instance.execution_data, subprocess_stack)
+                    .get("component", {})
+                    .get("version", None)
+                )
+                component = ComponentLibrary.get_component_class(component_code=component_code, version=version)
+                outputs_format = component.outputs_format()
+            except Exception:
+                logger.exception(
+                    "_format_outputs(node_id: {}, outputs: {}, component_code: {}) fail".format(
+                        self.node_id, outputs, component_code
+                    )
+                )
+                return False, "_format_outputs fail", []
+            else:
+                # for some special empty case e.g. ''
+                outputs_data = outputs.get("outputs") or {}
+                # 在标准插件定义中的预设输出参数
+                archived_keys = []
+                for outputs_item in outputs_format:
+                    if outputs_item["key"] == settings.PLUGIN_LOOP_OUTPUTS_KEY:
+                        continue
+                    value = outputs_data.get(outputs_item["key"], "")
+                    outputs_table.append(
+                        {"name": outputs_item["name"], "key": outputs_item["key"], "value": value, "preset": True}
+                    )
+                    archived_keys.append(outputs_item["key"])
+                # 其他输出参数
+                for out_key, out_value in list(outputs_data.items()):
+                    if out_key not in archived_keys:
+                        outputs_table.append(
+                            {
+                                "name": out_key[2:-1] if component_code == "subprocess_plugin" else out_key,
+                                "key": out_key,
+                                "value": out_value,
+                                "preset": component_code == "subprocess_plugin",
+                            }
+                        )
+        else:
+            try:
+                outputs_table = [
+                    {"key": key, "value": val, "preset": False}
+                    for key, val in list((outputs.get("outputs") or {}).items())
+                ]
+            except Exception:
+                logger.exception(
+                    "_format_outputs(node_id: {}, outputs: {}, component_code: {}) fail".format(
+                        self.node_id, outputs, component_code
+                    )
+                )
+                return False, "_format_outputs fail", []
+
+        node_id_constants_map = {}
+        try:
+            # 尝试搜索并替换变量重命名的值
+            constants = self.task_instance.execution_data.get("constants", {})
+
+            for key, value in constants.items():
+                # 只对输出进行重命名，如果变量来源非输出，则跳过
+                if not value.get("source_type") == "component_outputs":
+                    continue
+                # 搜索这些新变量的来源
+                source_info = value.get("source_info", {})
+                # 查看来源中是否有自己
+                if self.node_id in source_info.keys():
+                    if len(source_info[self.node_id]) > 0:
+                        # key = ${key}, key[2:-1] = key
+                        node_id_constants_map[source_info[self.node_id][0]] = key[2:-1]
+        except Exception as e:
+            logger.exception("[_format_outputs]变量重命名格式化失败，error={}".format(e))
+            return True, "", outputs_table
+
+        for item in outputs_table:
+            key = item.get("key")
+            if key in node_id_constants_map.keys():
+                # 替换key值
+                item["key"] = node_id_constants_map[key]
+
+        return True, "", outputs_table

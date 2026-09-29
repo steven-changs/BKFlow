@@ -1,0 +1,292 @@
+<template>
+  <div
+    v-bkloading="{ isLoading: categoryLoading || apiLoading }"
+    class="api-panel">
+    <bk-tab-panel
+      v-for="tab in apiTabList"
+      :key="tab.key"
+      :name="tab.key"
+      :label="tab.name"
+      class="api-plugin-panel">
+      <div
+        v-if="categoryList.length"
+        class="group-area">
+        <div
+          v-for="option in categoryList"
+          :key="option.id"
+          :class="['group-item', {
+            active: option.id === categoryActive
+          }]"
+          :data-test-id="`templateEdit_apiList_${option.id}`"
+          @click="onSelectCategory(option.id)">
+          {{ option.name }}
+        </div>
+      </div>
+      <div
+        class="api-list"
+        @scroll="handleApiPluginScroll">
+        <template v-if="apiList.length > 0">
+          <div
+            v-for="(plugin, index) in apiList"
+            :key="index"
+            :class="['plugin-item', { 'is-active': plugin.id === apiActive }]"
+            @click="onSelectApiPlugin(plugin)">
+            <span
+              v-if="plugin.highlightName"
+              class="plugin-name"
+              v-html="plugin.highlightName" />
+            <span
+              v-else
+              class="plugin-name">{{ plugin.name }}</span>
+          </div>
+        </template>
+        <NoData
+          v-else
+          :type="searchStr ? 'search-empty' : 'empty'"
+          :message="searchStr ? $t('搜索结果为空') : ''"
+          @searchClear="$emit('handleSearch', '')" />
+      </div>
+    </bk-tab-panel>
+  </div>
+</template>
+
+<script>
+  import { mapActions } from 'vuex';
+  import tools from '@/utils/tools.js';
+  import NoData from '@/components/common/base/NoData.vue';
+  export default {
+    name: 'ApiPlugin',
+    components: {
+      NoData,
+    },
+    props: {
+      apiTabList: {
+        type: Array,
+        default: () => ([]),
+      },
+      currentTab: {
+        type: String,
+        default: '',
+      },
+      searchStr: {
+        type: String,
+        default: '',
+      },
+      crtPlugin: {
+        type: String,
+        default: '',
+      },
+      crtGroup: {
+        type: String,
+        default: '',
+      },
+      spaceId: {
+        type: [Number, String],
+        default: '',
+      },
+      scopeInfo: {
+        type: Object,
+        default: () => ({}),
+      },
+    },
+    data() {
+      return {
+        categoryLoading: false,
+        apiLoading: false,
+        categoryList: [],
+        categoryActive: '',
+        apiList: [],
+        apiActive: this.apiTabList.some(item => item.key === this.currentTab) ? this.crtPlugin : '',
+        pagination: {
+          current: 1,
+          count: 0,
+          limit: 30,
+        },
+      };
+    },
+    computed: {
+      crtApiConfig() {
+        return this.apiTabList.find(item => item.key === this.currentTab);
+      },
+      crtApiKey() {
+        return this.crtApiConfig?.key;
+      },
+      crtSourceKey() {
+        return this.crtApiConfig?.sourceKey || this.crtApiKey;
+      },
+    },
+    watch: {
+      crtApiKey: {
+        handler(val, oldVal) {
+          const preserveSelection = oldVal === undefined && Boolean(this.apiActive);
+          this.resetCatalogState(!preserveSelection);
+          if (val) {
+            this.getUniformCategoryList(preserveSelection ? this.crtGroup : '');
+          }
+        },
+        deep: true,
+        immediate: true,
+      },
+    },
+    methods: {
+      ...mapActions('template', [
+        'loadUniformCategoryList',
+        'loadUniformApiList',
+      ]),
+      resetCatalogState(clearSelection = true) {
+        this.categoryActive = '';
+        this.categoryList = [];
+        this.apiList = [];
+        this.pagination.current = 1;
+        this.pagination.count = 0;
+        if (clearSelection) {
+          this.apiActive = '';
+        }
+      },
+      async getUniformCategoryList(preferredCategory = '') {
+        try {
+          this.categoryLoading = true;
+          const resp = await this.loadUniformCategoryList({
+            ...this.scopeInfo,
+            spaceId: this.spaceId,
+            api_name: this.crtApiKey,
+          });
+          if (!resp.result) return;
+          this.categoryList = resp.data;
+          const hasPreferredCategory = this.categoryList.some(item => item.id === preferredCategory);
+          this.categoryActive = hasPreferredCategory ? preferredCategory : this.categoryList[0]?.id;
+          if (this.categoryActive) this.getUniformApiList();
+        } catch (error) {
+          console.warn(error);
+        } finally {
+          this.categoryLoading = false;
+        }
+      },
+      async getUniformApiList(reset = true) {
+        try {
+          this.apiLoading = true;
+          const { current, limit } = this.pagination;
+          const resp = await this.loadUniformApiList({
+            offset: (current - 1) * limit,
+            limit,
+            spaceId: this.spaceId,
+            ...this.scopeInfo,
+            category: this.categoryActive,
+            key: this.searchStr || undefined,
+            api_name: this.crtApiKey,
+          });
+          if (!resp.result) return;
+          const pluginList = resp.data.apis;
+          const searchStr = tools.escapeRegExp(this.searchStr);
+          const reg = new RegExp(searchStr, 'i');
+          pluginList.forEach((item) => {
+            if (this.searchStr !== '') {
+              item.highlightName = this.filterXSS(item.name).replace(reg, `<span style="color: #ff9c01;">${this.searchStr}</span>`);
+            }
+          });
+          if (reset) {
+            this.apiList = pluginList;
+          } else {
+            this.apiList.push(...pluginList);
+          }
+          this.pagination.count = resp.data.total;
+        } catch (error) {
+          console.warn(error);
+        } finally {
+          this.apiLoading = false;
+        }
+      },
+      // 滚动加载逻辑
+      handleApiPluginScroll(e) {
+        if (this.apiLoading || this.pagination.count === this.apiList.length) {
+          return;
+        }
+        const { scrollTop, clientHeight, scrollHeight } = e.target;
+        if (scrollHeight - scrollTop - clientHeight < 10) {
+          this.pagination.current += 1;
+          this.getUniformApiList(false);
+        }
+      },
+      onSelectCategory(categoryId) {
+        this.categoryActive = categoryId;
+        this.pagination.current = 1;
+        this.getUniformApiList();
+      },
+      handleSearch() {
+        this.pagination.current = 1;
+        this.pagination.count = 0;
+        this.apiList = [];
+        if (this.categoryActive) this.getUniformApiList();
+      },
+      onSelectApiPlugin(plugin) {
+        const {
+          id,
+          name,
+          category: pluginCategory,
+          default_version,
+          latest_version,
+          versions,
+          meta_url_template,
+          meta_url,
+          description,
+          plugin_source,
+          plugin_code,
+          wrapper_version,
+        } = plugin;
+        const categoryId = pluginCategory || this.categoryActive;
+        const category = this.categoryList.find(item => item.id === categoryId) || {};
+        this.$emit('select', {
+          id,
+          code: 'uniform_api',
+          name,
+          group_id: categoryId,
+          group_name: category.name || categoryId,
+          metaUrl: meta_url,
+          apiKey: this.crtApiKey,
+          sourceKey: this.crtSourceKey,
+          pluginSource: plugin_source,
+          pluginCode: plugin_code,
+          wrapperVersion: wrapper_version,
+          list: versions || [],
+          latest_version,
+          default_version,
+          meta_url_template,
+          desc: description,
+        });
+      },
+    },
+  };
+</script>
+
+<style lang="scss" scoped>
+@import '../../../../../scss/mixins/scrollbar.scss';
+.api-plugin-panel {
+  .api-list {
+    height: 100%;
+    font-size: 12px;
+    color: #63656e;
+    overflow: auto;
+    @include scrollbar;
+    .plugin-item {
+      position: relative;
+      padding: 0 40px 0 20px;
+      height: 42px;
+      line-height: 42px;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      cursor: pointer;
+      &:hover {
+        background: #e1ecff;
+        color: #3a84ff;
+      }
+      &.is-active {
+        background: #e1ecff;
+        & > .plugin-name {
+          color: #3a84ff;
+        }
+      }
+    }
+  }
+}
+</style>

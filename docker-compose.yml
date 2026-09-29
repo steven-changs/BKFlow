@@ -1,0 +1,152 @@
+# BKFlow Docker Compose 配置
+# 用于完全容器化部署（备用方案）
+
+version: '3.8'
+
+services:
+  # MySQL 数据库
+  mysql:
+    image: mysql:8.0
+    container_name: bkflow_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: bkflow
+      MYSQL_USER: bkflow
+      MYSQL_PASSWORD: bkflow123
+      TZ: Asia/Shanghai
+    ports:
+      - "3307:3306"  # 映射到 3307 避免与本地 MySQL 冲突
+    volumes:
+      - bkflow_mysql_data:/var/lib/mysql
+      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    networks:
+      - bkflow_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis 缓存
+  redis:
+    image: redis:7-alpine
+    container_name: bkflow_redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"  # 映射到 6380 避免与本地 Redis 冲突
+    volumes:
+      - bkflow_redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - bkflow_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # BKFlow 应用
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bkflow_app
+    restart: unless-stopped
+    environment:
+      - BKPAAS_ENVIRONMENT=dev
+      - DATABASE_HOST=mysql
+      - DATABASE_PORT=3306
+      - DATABASE_NAME=bkflow
+      - DATABASE_USER=bkflow
+      - DATABASE_PASSWORD=bkflow123
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./media:/app/media
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bkflow_network
+    command: >
+      sh -c "
+        python manage.py migrate &&
+        python manage.py collectstatic --noinput &&
+        gunicorn wsgi:application -w 4 -b 0.0.0.0:8000 --timeout 120
+      "
+
+  # Celery Worker
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bkflow_celery_worker
+    restart: unless-stopped
+    environment:
+      - BKPAAS_ENVIRONMENT=dev
+      - DATABASE_HOST=mysql
+      - DATABASE_PORT=3306
+      - DATABASE_NAME=bkflow
+      - DATABASE_USER=bkflow
+      - DATABASE_PASSWORD=bkflow123
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - mysql
+      - redis
+      - app
+    networks:
+      - bkflow_network
+    command: celery -A bkflow worker -l info -c 4
+
+  # Celery Beat
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bkflow_celery_beat
+    restart: unless-stopped
+    environment:
+      - BKPAAS_ENVIRONMENT=dev
+      - DATABASE_HOST=mysql
+      - DATABASE_PORT=3306
+      - DATABASE_NAME=bkflow
+      - DATABASE_USER=bkflow
+      - DATABASE_PASSWORD=bkflow123
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - mysql
+      - redis
+      - app
+    networks:
+      - bkflow_network
+    command: celery -A bkflow beat -l info
+
+networks:
+  bkflow_network:
+    driver: bridge
+    name: bkflow_network
+
+volumes:
+  bkflow_mysql_data:
+    name: bkflow_mysql_data
+  bkflow_redis_data:
+    name: bkflow_redis_data

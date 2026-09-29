@@ -1,0 +1,240 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+
+import json
+import logging
+import traceback
+
+from blueapps.account import ConfFixture
+from blueapps.account.decorators import login_exempt
+from blueapps.account.handlers.response import ResponseHandler
+from cryptography.fernet import Fernet
+from django.conf import settings
+from django.contrib.auth import logout
+from django.http import JsonResponse
+from django.shortcuts import render
+from django.utils.translation import ugettext_lazy as _
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django.views.decorators.http import require_GET, require_POST
+
+from bkflow.contrib.api.collections.task import TaskComponentClient
+from bkflow.interface.models import UserPreference
+from bkflow.space.configs import SuperusersConfig
+from bkflow.space.models import Space, SpaceConfig
+from bkflow.space.tenant import ensure_space_tenant, tenant_space_ids
+from bkflow.task.open_plugin_callback import OPEN_PLUGIN_CALLBACK_TOKEN_META_KEY
+from packages.bkapi.bk_cmsi.shortcuts import get_client_by_username
+
+logger = logging.getLogger("root")
+
+
+@ensure_csrf_cookie
+def home(request):
+    return render(request, "base_vue.html")
+
+
+def user_exit(request):
+    logout(request)
+    # 验证不通过，需要跳转至统一登录平台
+    request.path = request.path.replace("logout", "")
+    handler = ResponseHandler(ConfFixture, settings)
+    return handler.build_401_response(request)
+
+
+@ensure_csrf_cookie
+def is_admin_or_space_superuser(request):
+    """
+    判断是否是管理员或者空间超级管理员
+    """
+    space_ids = SpaceConfig.objects.get_space_ids_of_superuser(request.user.username)
+    is_space_superuser = (
+        True
+        if (
+            space_ids
+            and Space.objects.filter(id__in=tenant_space_ids(request))
+            .filter(id__in=space_ids, is_deleted=False)
+            .exists()
+        )
+        else False
+    )
+
+    return JsonResponse(
+        {
+            "result": True,
+            "data": {"is_admin": request.user.is_superuser, "is_space_superuser": is_space_superuser},
+            "message": "",
+        }
+    )
+
+
+@ensure_csrf_cookie
+def is_admin_or_current_space_superuser(request):
+    """
+    判断是否是管理员或者当前空间超级管理员
+    """
+    space_id = request.GET.get("space_id")
+
+    if space_id is None:
+        return JsonResponse({"result": False, "data": None, "message": "space_id is required"})
+
+    ensure_space_tenant(request, space_id)
+    is_space_superuser = SpaceConfig.objects.filter(
+        space_id=space_id, name=SuperusersConfig.name, json_value__contains=request.user.username
+    ).exists()
+
+    return JsonResponse(
+        {
+            "result": True,
+            "data": {"is_admin": request.user.is_superuser, "is_space_superuser": is_space_superuser},
+            "message": "",
+        }
+    )
+
+
+@require_GET
+def get_msg_types(request):
+    if not settings.ENABLE_MULTI_TENANT_MODE:
+        from blueapps.utils import get_client_by_request
+
+        return JsonResponse(get_client_by_request(request).cmsi.get_msg_type())
+    client = get_client_by_username(request.user.username, stage=settings.BK_APIGW_STAGE_NAME)
+    result = client.api.v1_channels_list(headers={"X-Bk-Tenant-Id": request.user.tenant_id})
+    return JsonResponse(result)
+
+
+@login_exempt
+@csrf_exempt
+@require_POST
+def callback(request, token):
+    try:
+        f = Fernet(settings.CALLBACK_KEY)
+        back_load = f.decrypt(bytes(token, encoding="utf8")).decode().split(":")
+        # 不带 root_pipeline_id 的回调 payload
+        [space_id, task_id, node_id, node_version] = back_load[:4]
+    except Exception:
+        logger.warning("invalid token %s" % token)
+        return JsonResponse({"result": False, "message": "invalid token"}, status=400)
+    try:
+        callback_data = json.loads(request.body)
+    except Exception:
+        message = _("节点回调失败: 无效的请求, 请重试. 如持续失败可联系管理员处理. {msg} | api callback").format(msg=traceback.format_exc())
+        logger.error(message)
+        return JsonResponse({"result": False, "message": message}, status=400)
+
+    callback_token = request.META.get(OPEN_PLUGIN_CALLBACK_TOKEN_META_KEY, "")
+    is_open_plugin_callback = bool(callback_token)
+    if is_open_plugin_callback:
+        if (
+            not isinstance(callback_data, dict)
+            or not callback_data.get("open_plugin_run_id")
+            or not callback_data.get("status")
+        ):
+            return JsonResponse({"result": False, "message": "invalid callback payload"}, status=400)
+        if not callback_token:
+            return JsonResponse({"result": False, "message": "missing callback token"}, status=400)
+        callback_data["_callback_token"] = callback_token
+
+    client = TaskComponentClient(space_id=space_id)
+
+    data = {"version": node_version, "data": callback_data}
+    try:
+        resp = client.node_operate(task_id=task_id, node_id=node_id, operation="callback", data=data)
+    except Exception:
+        message = _("节点回调失败: 请求失败task模块失败. {msg} | api callback").format(msg=traceback.format_exc())
+        logger.error(message)
+        return JsonResponse({"result": False, "message": message}, status=400)
+
+    logger.info(
+        "[callback] resp, space_id={}, task_id={}, node_id={}, resp={}".format(space_id, task_id, node_id, resp)
+    )
+    status = 400 if is_open_plugin_callback and not resp.get("result") else 200
+    return JsonResponse(resp, status=status)
+
+
+@ensure_csrf_cookie
+@require_GET
+def get_user_preference(request):
+    """
+    获取用户偏好设置
+    """
+    username = request.user.username
+    try:
+        preference = UserPreference.objects.get(username=username)
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "last_selected_space_id": preference.last_selected_space_id,
+                    "preferences": preference.preferences,
+                },
+                "message": "",
+            }
+        )
+    except UserPreference.DoesNotExist:
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "last_selected_space_id": None,
+                    "preferences": {},
+                },
+                "message": "",
+            }
+        )
+    except Exception as e:
+        logger.error(f"[get_user_preference] Error: {str(e)}")
+        return JsonResponse({"result": False, "data": None, "message": str(e)}, status=500)
+
+
+@ensure_csrf_cookie
+@require_POST
+def save_user_preference(request):
+    """
+    保存用户偏好设置
+    """
+    username = request.user.username
+    try:
+        data = json.loads(request.body)
+        space_id = data.get("space_id")
+
+        if space_id is None:
+            return JsonResponse({"result": False, "data": None, "message": "space_id is required"})
+
+        # 更新或创建用户偏好
+        preference, created = UserPreference.objects.update_or_create(
+            username=username,
+            defaults={"last_selected_space_id": space_id}
+        )
+
+        logger.info(f"[save_user_preference] User: {username}, Space ID: {space_id}, Created: {created}")
+
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "last_selected_space_id": preference.last_selected_space_id,
+                },
+                "message": "保存成功" if created else "更新成功",
+            }
+        )
+    except json.JSONDecodeError:
+        return JsonResponse({"result": False, "data": None, "message": "Invalid JSON"}, status=400)
+    except Exception as e:
+        logger.error(f"[save_user_preference] Error: {str(e)}")
+        return JsonResponse({"result": False, "data": None, "message": str(e)}, status=500)

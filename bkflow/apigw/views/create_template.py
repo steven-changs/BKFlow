@@ -1,0 +1,125 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+import copy
+import json
+import logging
+
+from apigw_manager.apigw.decorators import apigw_require
+from blueapps.account.decorators import login_exempt
+from django.db import transaction
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+
+from bkflow.apigw.decorators import check_jwt_and_space, return_json_response
+from bkflow.apigw.exceptions import CreateTemplateException, GatewayExpressionException
+from bkflow.apigw.serializers.template import CreateTemplateApigwSerializer
+from bkflow.constants import RecordType, TemplateOperationSource, TemplateOperationType
+from bkflow.contrib.operation_record.decorators import record_operation
+from bkflow.exceptions import ValidationError
+from bkflow.label.models import Label, TemplateLabelRelation
+from bkflow.label.serializers import LabelSerializer
+from bkflow.space.configs import FlowVersioning, GatewayExpressionConfig
+from bkflow.space.models import SpaceConfig
+from bkflow.space.utils import build_default_pipeline_tree_with_space_id
+from bkflow.template.models import Template, TemplateSnapshot
+from bkflow.template.utils import validate_pipeline_tree_gateway_expression
+from bkflow.utils import err_code
+from bkflow.utils.canvas import OperateType
+from bkflow.utils.pipeline import replace_pipeline_tree_node_ids
+from bkflow.utils.webhook import apply_webhook_configs
+
+logger = logging.getLogger("root")
+
+
+@login_exempt
+@csrf_exempt
+@require_POST
+@apigw_require
+@check_jwt_and_space
+@return_json_response
+@record_operation(
+    RecordType.template.name,
+    TemplateOperationType.create.name,
+    TemplateOperationSource.api.name,
+    extra_info={"tag": "apigw"},
+)
+def create_template(request, space_id):
+    """
+    创建模板
+    data = {}
+    """
+
+    data = json.loads(request.body or "{}")
+
+    ser = CreateTemplateApigwSerializer(data=data, context={"space_id": int(space_id), "request": request})
+    ser.is_valid(raise_exception=True)
+
+    validate_data = dict(ser.validated_data)
+    webhook_configs = validate_data.pop("webhook_configs", [])
+    auto_release = validate_data.pop("auto_release", False)
+
+    label_ids = validate_data.pop("label_ids", [])
+    label_ids = list(set(label_ids))
+
+    source_template_id = validate_data.pop("source_template_id", None)
+    pipeline_tree = validate_data.pop("pipeline_tree", None)
+    if source_template_id:
+        # 在序列化器中已经判断了存在，所以不需要处理异常
+        source_template = Template.objects.get(id=source_template_id)
+        pipeline_tree = copy.deepcopy(source_template.pipeline_tree)
+        replace_pipeline_tree_node_ids(pipeline_tree, OperateType.CREATE_TEMPLATE.value)
+    elif pipeline_tree:
+        replace_pipeline_tree_node_ids(pipeline_tree, OperateType.CREATE_TEMPLATE.value)
+    else:
+        pipeline_tree = build_default_pipeline_tree_with_space_id(space_id)
+
+    try:
+        space_gateway_expression = SpaceConfig.get_config(space_id, GatewayExpressionConfig.name)
+        validate_pipeline_tree_gateway_expression(pipeline_tree, space_gateway_expression)
+    except ValidationError as e:
+        raise GatewayExpressionException(str(e))
+
+    # 涉及到两张表的创建，需要那个开启事物，确保两张表全部都创建成功
+    with transaction.atomic():
+        username = validate_data.pop("creator", "") or request.user.username
+        if SpaceConfig.get_config(space_id=space_id, config_name=FlowVersioning.name) == "true":
+            if auto_release:
+                snapshot = TemplateSnapshot.create_draft_snapshot(pipeline_tree, username, "1.0.0")
+            else:
+                snapshot = TemplateSnapshot.create_draft_snapshot(pipeline_tree, username)
+        else:
+            snapshot = TemplateSnapshot.create_snapshot(pipeline_tree, username, "1.0.0")
+        template = Template.objects.create(
+            **validate_data, snapshot_id=snapshot.id, space_id=space_id, updated_by=username, creator=username
+        )
+        snapshot.template_id = template.id
+        snapshot.save(update_fields=["template_id"])
+        TemplateLabelRelation.objects.set_labels(template.id, label_ids)
+
+        if webhook_configs:
+            apply_result = apply_webhook_configs(webhook_configs, str(template.id))
+            if not apply_result["result"]:
+                message = apply_result["message"]
+                logger.error(message)
+                raise CreateTemplateException(f"创建模板失败，错误: {str(message)}")
+
+    resp_data = template.to_json()
+    resp_data["labels"] = LabelSerializer(Label.objects.filter(id__in=label_ids), many=True).data if label_ids else []
+
+    return {"result": True, "data": resp_data, "code": err_code.SUCCESS.code}

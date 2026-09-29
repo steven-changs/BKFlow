@@ -1,0 +1,167 @@
+/**
+* Tencent is pleased to support the open source community by making 蓝鲸智云PaaS平台社区版 (BlueKing PaaS Community
+* Edition) available.
+* Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
+* Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+* http://opensource.org/licenses/MIT
+* Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+* an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+* specific language governing permissions and limitations under the License.
+*/
+<template>
+  <div class="tag-input">
+    <div class="rf-form-wrapper">
+      <template v-if="formMode">
+        <el-input
+          v-model="inputValue"
+          type="text"
+          :disabled="!editable || disabled"
+          :show-password="showPassword"
+          :placeholder="placeholder"
+          @input="onInput" />
+        <VariableList
+          ref="variableListRef"
+          :is-list-open="showVarList && isListOpen"
+          :var-list="varList"
+          :textarea-height="36"
+          @select="onSelectVal" />
+      </template>
+      <span
+        v-else
+        class="rf-view-value">{{ viewValue }}</span>
+    </div>
+    <span
+      v-show="!validateInfo.valid"
+      class="common-error-tip error-info">{{ validateInfo.message }}</span>
+  </div>
+</template>
+<script>
+  import '@/utils/i18n.js';
+  import { mapState } from 'vuex';
+  import { getFormMixins } from '../formMixins.js';
+  import VariableList from '../VariableList.vue';
+
+  const VAR_REG = /\$.*$/;
+
+  export const attrs = {
+    placeholder: {
+      type: String,
+      required: false,
+      default: '',
+      desc: 'placeholder',
+    },
+    disabled: {
+      type: Boolean,
+      required: false,
+      default: false,
+      desc: gettext('禁用表单输入'),
+    },
+    showPassword: {
+      type: Boolean,
+      required: false,
+      default: false,
+      desc: gettext('是否以密码模式显示'),
+    },
+    value: {
+      type: [String, Number],
+      required: false,
+      default: '',
+    },
+    showVarList: {
+      type: Boolean,
+      default: false,
+      inner: true,
+    },
+  };
+  export default {
+    name: 'TagInput',
+    components: {
+      VariableList,
+    },
+    mixins: [getFormMixins(attrs)],
+    props: {
+      isSubflow: {
+        type: Boolean,
+        default: false,
+      },
+      subflowLoopVars: {
+        type: Object,
+        default: () => ({}),
+      },
+      outerConstants: {
+        type: Object,
+        default: () => ({}),
+      },
+    },
+    data() {
+      return {
+        isListOpen: false,
+        varList: [],
+      };
+    },
+    computed: {
+      ...mapState({
+        internalVariable: state => state.template.internalVariable,
+      }),
+      constantArr: {
+        get() {
+          return this.buildConstantArray(this.constants, this.internalVariable, this.isSubflow, this.subflowLoopVars, this.outerConstants);
+        },
+        set(val) {
+          this.varList = val;
+        },
+      },
+
+      inputValue: {
+        get() {
+          return this.value;
+        },
+        set(val) {
+          this.updateForm(val);
+        },
+      },
+      viewValue() {
+        if (this.value === '' || this.value === undefined) {
+          return '--';
+        }
+        return this.showPassword ? '******' : this.value;
+      },
+    },
+    created() {
+      window.addEventListener('click', this.handleListShow, false);
+    },
+    beforeDestroy() {
+      window.removeEventListener('click', this.handleListShow, false);
+    },
+    methods: {
+      onInput(val) {
+        const result = this.filterVariableList(val, this.constantArr, VAR_REG);
+        this.varList = result.varList;
+        this.isListOpen = result.isListOpen;
+        // 清空当前变量列表的搜索关键词
+        this.$nextTick(() => {
+          const currentVariableList = this.$refs.variableListRef;
+          if (currentVariableList) {
+            currentVariableList.searchKeyword = '';
+          }
+        });
+      },
+      onSelectVal(val) {
+        const replacedValue = this.value.replace(VAR_REG, val);
+        this.updateForm(replacedValue);
+        this.isListOpen = false;
+      },
+    },
+  };
+</script>
+<style lang="scss" scoped>
+.tag-input {
+    ::v-deep .el-input__inner {
+        padding: 0 10px;
+    }
+    .rf-form-wrapper {
+        position: relative;
+    }
+}
+</style>

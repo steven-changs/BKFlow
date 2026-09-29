@@ -1,0 +1,248 @@
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸流程引擎服务 (BlueKing Flow Engine Service) available.
+Copyright (C) 2024 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+We undertake not to change the open source license (MIT license) applicable
+
+to the current version of the project delivered to anyone in the future.
+"""
+
+import logging
+
+from django.db.models import Q
+from django.utils.translation import ugettext_lazy as _
+from pipeline.validators import validate_pipeline_tree
+from rest_framework import serializers
+
+from bkflow.constants import MAX_LEN_OF_TEMPLATE_NAME, USER_NAME_MAX_LENGTH
+from bkflow.exceptions import ValidationError
+from bkflow.label.models import Label
+from bkflow.space.configs import GatewayExpressionConfig, TemplateTriggerConfig
+from bkflow.space.models import Space, SpaceConfig
+from bkflow.template.models import Template, Trigger
+from bkflow.template.serializers.trigger import TriggerSerializer
+from bkflow.template.tenant import validate_template_references
+from bkflow.template.utils import validate_pipeline_tree_gateway_expression
+
+logger = logging.getLogger("root")
+
+
+def _validate_template_label_ids(label_ids, space_id):
+    if not label_ids:
+        return
+
+    if space_id is None:
+        raise serializers.ValidationError(_("space_id 不能为空"))
+
+    if not Label.objects.check_label_ids(label_ids):
+        raise serializers.ValidationError(_("标签不存在，请检查 label_ids"))
+
+    invalid_scope_label_ids = list(
+        Label.objects.filter(id__in=label_ids)
+        .exclude(Q(label_scope__contains=["template"]) | Q(label_scope__contains=["common"]))
+        .values_list("id", flat=True)
+    )
+    if invalid_scope_label_ids:
+        raise serializers.ValidationError(_("标签范围校验失败，请选择 template 或 common 范围的标签"))
+
+    parent_label_ids = list(
+        Label.objects.filter(space_id=int(space_id), parent_id__in=label_ids)
+        .values_list("parent_id", flat=True)
+        .distinct()
+    )
+    if parent_label_ids:
+        raise serializers.ValidationError(_("父标签不能单独作为标签使用，请选择具体的子标签"))
+
+
+class CreateTemplateSerializer(serializers.Serializer):
+    """
+    创建模板的序列化器
+    """
+
+    creator = serializers.CharField(help_text=_("创建人"), max_length=USER_NAME_MAX_LENGTH, required=False)
+    source_template_id = serializers.IntegerField(help_text=_("来源的模板id"), required=False)
+    name = serializers.CharField(help_text=_("模版名称"), max_length=MAX_LEN_OF_TEMPLATE_NAME, required=True)
+    notify_config = serializers.JSONField(help_text=_("通知配置"), required=False)
+    desc = serializers.CharField(help_text=_("描述"), max_length=256, required=False, allow_blank=True, allow_null=True)
+    scope_type = serializers.CharField(help_text=_("流程范围类型"), max_length=128, required=False)
+    scope_value = serializers.CharField(help_text=_("流程范围值"), max_length=128, required=False)
+    source = serializers.CharField(help_text=_("来源"), max_length=32, required=False, allow_blank=True, allow_null=True)
+    bind_app_code = serializers.CharField(
+        help_text=_("绑定的应用编码"), max_length=128, required=False, allow_null=True, allow_blank=True
+    )
+    extra_info = serializers.JSONField(help_text=_("额外扩展信息"), required=False)
+    pipeline_tree = serializers.JSONField(help_text=_("任务树"), required=False)
+    label_ids = serializers.ListField(help_text=_("标签"), child=serializers.IntegerField(), required=False)
+
+    def validate(self, attrs):
+        # 将 bind_app_code 映射到 bk_app_code 字段（models 中的字段名）
+        if "bind_app_code" in attrs:
+            attrs["bk_app_code"] = attrs.pop("bind_app_code")
+
+        scope_type = attrs.get("scope_type")
+        scope_value = attrs.get("scope_value")
+
+        if (scope_type is not None) != (scope_value is not None):
+            raise serializers.ValidationError(_("作用域类型和作用域值必须同时填写，或同时不填写"))
+
+        source_template_id = attrs.get("source_template_id")
+        if source_template_id:
+            try:
+                template = Template.objects.get(id=source_template_id, is_deleted=False)
+            except Template.DoesNotExist:
+                raise serializers.ValidationError(_(f"复制的源模板不存在, 请检查: {source_template_id}"))
+
+            if template.space_id != self.context.get("space_id"):
+                raise serializers.ValidationError(
+                    _("只能复制同一个空间下的模板, space_id={space_id}").format(space_id=template.space_id)
+                )
+
+        pipeline_tree = attrs.get("pipeline_tree")
+
+        if pipeline_tree:
+            try:
+                validate_pipeline_tree(pipeline_tree, cycle_tolerate=True)
+            except Exception as e:
+                logger.exception(f"CreateTemplateSerializer pipeline validate error, err = {e}")
+                raise serializers.ValidationError(_(f"参数校验失败，pipeline校验不通过, err={e}"))
+
+        creator = attrs.get("creator")
+        if not creator and not self.context.get("request").user.username:
+            raise serializers.ValidationError(_("网关用户和creator都为空，请检查"))
+
+        if pipeline_tree:
+            validate_template_references(self.context.get("space_id"), pipeline_tree)
+        _validate_template_label_ids(attrs.get("label_ids") or [], self.context.get("space_id"))
+
+        return attrs
+
+
+class CreateTemplateApigwSerializer(CreateTemplateSerializer):
+    auto_release = serializers.BooleanField(help_text=_("是否自动发布"), required=False, default=False)
+    webhook_configs = serializers.JSONField(help_text="webhook配置", required=False)
+
+
+class DeleteTemplateSerializer(serializers.Serializer):
+    template_id = serializers.IntegerField(help_text=_("模板ID"), required=True)
+    space_id = serializers.IntegerField(help_text=_("空间ID"), required=False)
+
+    def validate_space_id(self, space_id):
+        if not Space.exists(space_id=space_id):
+            raise serializers.ValidationError(_(f"校验失败，space_id={space_id}对应的空间不存在"))
+
+        return space_id
+
+
+class BatchDeleteTemplateSerializer(serializers.Serializer):
+    template_ids = serializers.ListField(
+        help_text=_("模板ID列表"),
+        required=True,
+        child=serializers.IntegerField(),
+        min_length=1,
+        max_length=200,
+        error_messages={
+            "min_length": _("template_ids 不能为空，至少需要包含一个模板ID"),
+            "max_length": _("template_ids 不能超过200个长度"),
+        },
+    )
+
+
+class UpdateTemplateSerializer(serializers.Serializer):
+    operator = serializers.CharField(help_text=_("更新人"), max_length=USER_NAME_MAX_LENGTH, required=False)
+    name = serializers.CharField(help_text=_("模版名称"), max_length=MAX_LEN_OF_TEMPLATE_NAME, required=False)
+    notify_config = serializers.JSONField(help_text=_("通知配置"), required=False)
+    desc = serializers.CharField(help_text=_("描述"), max_length=256, required=False, allow_blank=True, allow_null=True)
+    scope_type = serializers.CharField(help_text=_("流程范围类型"), max_length=128, required=False)
+    scope_value = serializers.CharField(help_text=_("流程范围值"), max_length=128, required=False)
+    source = serializers.CharField(help_text=_("来源"), max_length=32, required=False, allow_blank=True, allow_null=True)
+    version = serializers.CharField(help_text=_("版本号"), max_length=32, required=False)
+    extra_info = serializers.JSONField(help_text=_("额外扩展信息"), required=False)
+    pipeline_tree = serializers.JSONField(help_text=_("任务树"), required=False)
+    auto_release = serializers.BooleanField(help_text=_("是否自动发布"), required=False, default=False)
+    label_ids = serializers.ListField(help_text=_("标签"), child=serializers.IntegerField(), required=False)
+    webhook_configs = serializers.JSONField(help_text="webhook配置", required=False)
+    enable_webhook = serializers.BooleanField(help_text="是否启用webhook", required=False)
+    triggers = TriggerSerializer(many=True, required=False, allow_null=True)
+
+    def validate_triggers(self, triggers):
+        space_id = self.context["space_id"]
+        periodic_triggers = [trigger for trigger in triggers if trigger.get("type") == Trigger.TYPE_PERIODIC]
+        if len(periodic_triggers) > 1 and SpaceConfig.get_config(space_id, TemplateTriggerConfig.name) == "false":
+            raise serializers.ValidationError(_("参数校验失败，该流程只允许有一个定时触发器！"))
+        return triggers
+
+    def validate(self, attrs):
+        operator = attrs.get("operator")
+        scope_type = attrs.get("scope_type")
+        scope_value = attrs.get("scope_value")
+
+        if (scope_type is not None) != (scope_value is not None):
+            raise serializers.ValidationError(_("作用域类型和作用域值必须同时填写，或同时不填写"))
+
+        if not operator and not self.context.get("request").user.username:
+            raise serializers.ValidationError(_("网关用户和operator都为空，请检查"))
+
+        pipeline_tree = attrs.get("pipeline_tree")
+
+        if pipeline_tree:
+            try:
+                validate_pipeline_tree(pipeline_tree, cycle_tolerate=True)
+            except Exception as e:
+                logger.exception(f"CreateTemplateSerializer pipeline validate error, err = {e}")
+                raise serializers.ValidationError(_(f"参数校验失败，pipeline校验不通过, err={e}"))
+
+            space_id = self.context.get("space_id")
+            try:
+                space_gateway_expression = SpaceConfig.get_config(space_id, GatewayExpressionConfig.name)
+                validate_pipeline_tree_gateway_expression(pipeline_tree, space_gateway_expression)
+            except ValidationError as e:
+                raise serializers.ValidationError(_(f"参数校验失败，pipeline网关表达式校验不通过, err={e}"))
+
+        if "label_ids" in attrs:
+            _validate_template_label_ids(attrs.get("label_ids") or [], self.context.get("space_id"))
+
+        if pipeline_tree:
+            validate_template_references(self.context.get("space_id"), pipeline_tree)
+
+        return attrs
+
+
+class UpdateTemplateLabelsSerializer(serializers.Serializer):
+    label_ids = serializers.ListField(help_text=_("标签ID列表"), required=True, child=serializers.IntegerField())
+
+    def validate_label_ids(self, value):
+        _validate_template_label_ids(value, self.context.get("space_id"))
+        return value
+
+
+class TemplateListFilterSerializer(serializers.Serializer):
+    id = serializers.CharField(help_text=_("模板ID，多个以逗号分割"), required=False)
+    name = serializers.CharField(help_text=_("模板名称"), max_length=MAX_LEN_OF_TEMPLATE_NAME, required=False)
+    creator = serializers.CharField(help_text=_("创建人"), max_length=USER_NAME_MAX_LENGTH, required=False)
+    updated_by = serializers.CharField(help_text=_("更新人"), required=False)
+    scope_type = serializers.CharField(help_text=_("流程范围类型"), max_length=128, required=False)
+    scope_value = serializers.CharField(help_text=_("流程范围值"), max_length=128, required=False)
+    create_at_start = serializers.DateTimeField(help_text=_("开始时间小于等于"), required=False)
+    create_at_end = serializers.DateTimeField(help_text=_("开始时间大于等于"), required=False)
+    order_by = serializers.CharField(help_text=_("排序字段"), required=False, default="-create_at")
+    label = serializers.CharField(help_text=_("标签名称"), required=False)
+
+
+class TemplateDetailQuerySerializer(serializers.Serializer):
+    with_mock_data = serializers.BooleanField(help_text=_("是否包含 mock 数据"), required=False)
+    format = serializers.ChoiceField(
+        help_text=_("返回数据格式，raw-原始格式，pipeline_tree-流程树格式，plugin-插件格式"),
+        choices=["raw", "pipeline_tree", "plugin"],
+        required=False,
+        default="raw",
+    )
