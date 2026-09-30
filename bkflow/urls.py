@@ -71,7 +71,6 @@ urlpatterns = [
 if settings.BKFLOW_MODULE.type == BKFLOWModuleType.interface:
     urlpatterns += [
         url(r"^", include("bkflow.interface.urls")),
-        url(r"^api/user/", include("bkflow.interface.user_urls")),  # 用户偏好设置 API
         url(r"^api/template/", include("bkflow.template.urls")),
         url(r"^api/decision_table/", include("bkflow.decision_table.urls")),
         url(r"^api/space/", include("bkflow.space.urls")),

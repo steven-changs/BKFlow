@@ -297,8 +297,10 @@
       async restoreLastSelectedSpace() {
         try {
           const resp = await this.getUserPreference();
-          if (resp.result && resp.data && resp.data.last_selected_space_id) {
-            const lastSpaceId = resp.data.last_selected_space_id;
+          // 后端可能包装响应为 {result, data} 格式，需要兼容处理
+          const data = resp.data || resp;
+          if (data && data.last_selected_space_id) {
+            const lastSpaceId = data.last_selected_space_id;
             // 检查该空间是否在当前列表中
             const spaceExists = this.spaceList.some(space => space.id === lastSpaceId);
             if (spaceExists) {
@@ -316,7 +318,7 @@
        */
       async saveUserSpacePreference(spaceId) {
         try {
-          await this.saveUserPreference({ space_id: spaceId });
+          await this.saveUserPreference(spaceId);
           console.log(`[MenuSelect] 保存用户选择的空间: ${spaceId}`);
         } catch (error) {
           console.warn('[MenuSelect] 保存用户偏好设置失败:', error);
